@@ -15,6 +15,7 @@ A pure Swift MP3 encoder with no external dependencies beyond Apple's Accelerate
 - Transient detection with short/long/mixed block switching
 - ISO 11172-3 compliant Huffman coding and polyphase filterbank
 - Uses Accelerate (vDSP/vForce) for vectorized DSP operations
+- ID3v2.3 metadata tagging (title, artist, album, artwork, etc.)
 - Fully `Sendable` â€” safe to use from any concurrency context
 
 ## Requirements
@@ -94,6 +95,32 @@ let encoder = MP3Encoder(options: options)
 try await encoder.encode(sampleSource, to: outputURL)
 ```
 
+### Metadata
+
+Embed ID3v2.3 tags (title, artist, album, artwork, etc.) in your MP3 files:
+
+```swift
+let options = MP3EncoderOptions(
+  id3Tag: ID3Tag(title: "My Song", artist: "Artist", album: "Album")
+)
+let encoder = MP3Encoder(options: options)
+try await encoder.encode(source, to: url)
+```
+
+For album artwork:
+
+```swift
+let artwork = try Data(contentsOf: coverImageURL)
+let options = MP3EncoderOptions(
+  id3Tag: ID3Tag(
+    title: "My Song",
+    artist: "Artist",
+    albumArt: artwork,
+    albumArtMIMEType: "image/png"
+  )
+)
+```
+
 ### Live Microphone Recording
 
 Feed audio from `AVAudioEngine` into an `AsyncStream` and encode to a file:
@@ -162,6 +189,7 @@ Configuration for the encoder.
 | `crcProtected` | `Bool` | `false` | Add CRC error detection to frames |
 | `original` | `Bool` | `true` | Set the original bit in frame headers |
 | `copyright` | `Bool` | `false` | Set the copyright bit in frame headers |
+| `id3Tag` | `ID3Tag?` | `nil` | ID3v2.3 metadata to embed at the start of the file |
 
 ### `MP3Encoder`
 
@@ -172,7 +200,7 @@ Stateless, `Sendable` encoder that holds configuration. Safe to share across tas
 | `init(options:)` | Create an encoder with the given options |
 | `newSession() -> EncoderSession` | Create a mutable encoding session for synchronous use |
 | `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of sample buffers |
-| `encode(_:to:) async throws` | Encode an `AsyncSequence` directly to a file with Xing header |
+| `encode(_:to:) async throws` | Encode an `AsyncSequence` directly to a file with Xing header (includes ID3 tag if set) |
 
 ### `EncoderSession`
 
@@ -182,9 +210,27 @@ Mutable encoding session created via `MP3Encoder.newSession()`. Not `Sendable` â
 |---|---|
 | `encode(samples: [Float]) -> Data` | Feed interleaved PCM samples, returns any complete MP3 frames |
 | `flush() -> Data` | Pads and encodes any remaining buffered samples |
+| `generateID3Tag() -> Data` | Generates the ID3v2.3 tag data (empty if no tag configured) |
 | `generateXingHeader() -> Data` | Generates a Xing/Info header frame (call after encoding is complete) |
 | `encodedFrameCount: UInt32` | Number of MP3 frames encoded so far |
 | `encodedByteCount: UInt32` | Total bytes of encoded audio data so far |
+
+### `ID3Tag`
+
+Metadata for ID3v2.3 tags, embedded at the start of the MP3 file.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `title` | `String?` | `nil` | Track title (TIT2) |
+| `artist` | `String?` | `nil` | Artist name (TPE1) |
+| `album` | `String?` | `nil` | Album name (TALB) |
+| `track` | `UInt16?` | `nil` | Track number (TRCK) |
+| `trackTotal` | `UInt16?` | `nil` | Total tracks (TRCK denominator) |
+| `year` | `UInt16?` | `nil` | Release year (TYER) |
+| `genre` | `String?` | `nil` | Genre name (TCON) |
+| `comment` | `String?` | `nil` | Comment (COMM) |
+| `albumArt` | `Data?` | `nil` | Album artwork JPEG or PNG data (APIC) |
+| `albumArtMIMEType` | `String` | `"image/jpeg"` | MIME type for album artwork |
 
 ### Sample Format
 

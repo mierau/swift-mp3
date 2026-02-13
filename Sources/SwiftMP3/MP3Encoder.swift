@@ -4,6 +4,55 @@
 import Foundation
 import Accelerate
 
+/// ID3v2.3 metadata for MP3 files.
+public struct ID3Tag: Sendable, Equatable {
+  /// The track title.
+  public var title: String?
+  /// The artist name.
+  public var artist: String?
+  /// The album name.
+  public var album: String?
+  /// The track number.
+  public var track: UInt16?
+  /// The total number of tracks.
+  public var trackTotal: UInt16?
+  /// The release year.
+  public var year: UInt16?
+  /// The genre name.
+  public var genre: String?
+  /// A comment.
+  public var comment: String?
+  /// Album artwork image data (JPEG or PNG).
+  public var albumArt: Data?
+  /// MIME type for the album artwork.
+  public var albumArtMIMEType: String
+
+  /// Creates a new ID3 tag with the given metadata.
+  public init(
+    title: String? = nil,
+    artist: String? = nil,
+    album: String? = nil,
+    track: UInt16? = nil,
+    trackTotal: UInt16? = nil,
+    year: UInt16? = nil,
+    genre: String? = nil,
+    comment: String? = nil,
+    albumArt: Data? = nil,
+    albumArtMIMEType: String = "image/jpeg"
+  ) {
+    self.title = title
+    self.artist = artist
+    self.album = album
+    self.track = track
+    self.trackTotal = trackTotal
+    self.year = year
+    self.genre = genre
+    self.comment = comment
+    self.albumArt = albumArt
+    self.albumArtMIMEType = albumArtMIMEType
+  }
+}
+
 /// Configuration options for the MP3 encoder.
 public struct MP3EncoderOptions: Sendable, Equatable {
   /// The channel mode for the encoded audio.
@@ -29,6 +78,8 @@ public struct MP3EncoderOptions: Sendable, Equatable {
   public var original: Bool
   /// Whether to set the copyright bit in the frame header.
   public var copyright: Bool
+  /// ID3v2.3 metadata tag to embed at the start of the file.
+  public var id3Tag: ID3Tag?
 
   /// Creates a new set of encoder options.
   /// - Parameters:
@@ -40,6 +91,7 @@ public struct MP3EncoderOptions: Sendable, Equatable {
   ///   - crcProtected: Enable CRC protection. Defaults to `false`.
   ///   - original: Set the original flag. Defaults to `true`.
   ///   - copyright: Set the copyright flag. Defaults to `false`.
+  ///   - id3Tag: ID3v2.3 metadata to embed. Defaults to `nil`.
   public init(
     sampleRate: Int = 44_100,
     bitrateKbps: Int = 128,
@@ -48,7 +100,8 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     quality: Int = 5,
     crcProtected: Bool = false,
     original: Bool = true,
-    copyright: Bool = false
+    copyright: Bool = false,
+    id3Tag: ID3Tag? = nil
   ) {
     self.sampleRate = sampleRate
     self.bitrateKbps = bitrateKbps
@@ -58,6 +111,7 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     self.crcProtected = crcProtected
     self.original = original
     self.copyright = copyright
+    self.id3Tag = id3Tag
   }
 }
 
@@ -137,20 +191,24 @@ public struct MP3Encoder: Sendable {
   ) async throws where S.Element == [Float] {
     var state = EncoderSession(options: self.options)
 
+    // Generate ID3 tag if metadata is configured
+    let id3Data = state.generateID3Tag()
+
     // Calculate Xing frame size for the placeholder
     let bitrateIndex = MP3Tables.bitrateIndex(for: self.options.bitrateKbps, sampleRate: self.options.sampleRate)
     let bitrateValue = MP3Tables.bitrateValue(for: bitrateIndex)
     let xingFrameSize = (144 * bitrateValue * 1000) / self.options.sampleRate
 
-    // Create the file with an empty placeholder for the Xing header
-    let placeholder = Data(count: xingFrameSize)
-    try placeholder.write(to: url)
+    // Create the file: [ID3 tag] + [Xing placeholder]
+    var fileHeader = id3Data
+    fileHeader.append(Data(count: xingFrameSize))
+    try fileHeader.write(to: url)
 
     let handle = try FileHandle(forWritingTo: url)
     defer { try? handle.close() }
 
-    // Seek past the placeholder
-    try handle.seek(toOffset: UInt64(xingFrameSize))
+    // Seek past ID3 tag and Xing placeholder
+    try handle.seek(toOffset: UInt64(id3Data.count + xingFrameSize))
 
     for try await samples in input {
       try Task.checkCancellation()
@@ -165,9 +223,9 @@ public struct MP3Encoder: Sendable {
       try handle.write(contentsOf: finalData)
     }
 
-    // Write the real Xing header at the start
+    // Write the real Xing header after the ID3 tag
     let xingHeader = state.generateXingHeader()
-    try handle.seek(toOffset: 0)
+    try handle.seek(toOffset: UInt64(id3Data.count))
     try handle.write(contentsOf: xingHeader)
   }
 }
@@ -261,6 +319,14 @@ public struct EncoderSession {
     let frameSamples = self.pcmBuffer
     self.pcmBuffer.removeAll()
     return self.encodeFrame(samples: frameSamples)
+  }
+
+  /// Generates the ID3v2.3 tag data for the configured metadata.
+  ///
+  /// Returns empty `Data` if no ID3 tag is configured or all fields are empty.
+  public func generateID3Tag() -> Data {
+    guard let tag = self.options.id3Tag else { return Data() }
+    return ID3TagWriter.build(tag: tag)
   }
 
   /// Generates a Xing/Info header frame for seeking and duration metadata.
@@ -881,6 +947,110 @@ public struct EncoderSession {
 
       return value < 0 ? -clamped : clamped
     }
+  }
+}
+
+// MARK: - ID3v2.3 Tag Writer
+
+/// Assembles ID3v2.3 binary tag data from an ``ID3Tag``.
+enum ID3TagWriter {
+  /// Builds a complete ID3v2.3 tag from the given metadata.
+  /// Returns empty `Data` if no fields are set.
+  static func build(tag: ID3Tag) -> Data {
+    var frames = Data()
+
+    if let title = tag.title { frames.append(textFrame(id: "TIT2", value: title)) }
+    if let artist = tag.artist { frames.append(textFrame(id: "TPE1", value: artist)) }
+    if let album = tag.album { frames.append(textFrame(id: "TALB", value: album)) }
+    if let genre = tag.genre { frames.append(textFrame(id: "TCON", value: genre)) }
+
+    if let year = tag.year {
+      frames.append(textFrame(id: "TYER", value: String(year)))
+    }
+
+    if let track = tag.track {
+      let value = tag.trackTotal != nil ? "\(track)/\(tag.trackTotal!)" : "\(track)"
+      frames.append(textFrame(id: "TRCK", value: value))
+    }
+
+    if let comment = tag.comment {
+      frames.append(commentFrame(comment: comment))
+    }
+
+    if let art = tag.albumArt {
+      frames.append(pictureFrame(art: art, mimeType: tag.albumArtMIMEType))
+    }
+
+    if frames.isEmpty { return Data() }
+
+    // ID3v2.3 header: "ID3" + version 2.3 + no flags + synchsafe size
+    var header = Data()
+    header.append(contentsOf: [0x49, 0x44, 0x33]) // "ID3"
+    header.append(contentsOf: [0x03, 0x00])        // Version 2.3
+    header.append(0x00)                             // Flags
+    header.append(contentsOf: synchsafeSize(UInt32(frames.count)))
+
+    return header + frames
+  }
+
+  /// Builds a text frame (TIT2, TPE1, TALB, TCON, TYER, TRCK).
+  private static func textFrame(id: String, value: String) -> Data {
+    let payload = Data(value.utf8)
+    // Encoding byte (0x03 = UTF-8) + string bytes
+    let contentSize = UInt32(1 + payload.count)
+    var frame = frameHeader(id: id, size: contentSize)
+    frame.append(0x03)  // UTF-8 encoding
+    frame.append(payload)
+    return frame
+  }
+
+  /// Builds a COMM (comment) frame.
+  private static func commentFrame(comment: String) -> Data {
+    let text = Data(comment.utf8)
+    // Encoding byte + "eng" + null-terminated description + text
+    let contentSize = UInt32(1 + 3 + 1 + text.count)
+    var frame = frameHeader(id: "COMM", size: contentSize)
+    frame.append(0x03)                                // UTF-8
+    frame.append(contentsOf: [0x65, 0x6E, 0x67])     // "eng"
+    frame.append(0x00)                                // Empty description
+    frame.append(text)
+    return frame
+  }
+
+  /// Builds an APIC (attached picture) frame.
+  private static func pictureFrame(art: Data, mimeType: String) -> Data {
+    let mime = Data(mimeType.utf8)
+    // Encoding byte + null-terminated MIME + picture type + null-terminated description + image
+    let contentSize = UInt32(1 + mime.count + 1 + 1 + 1 + art.count)
+    var frame = frameHeader(id: "APIC", size: contentSize)
+    frame.append(0x03)       // UTF-8
+    frame.append(mime)
+    frame.append(0x00)       // Null terminator for MIME
+    frame.append(0x03)       // Picture type: front cover
+    frame.append(0x00)       // Empty description
+    frame.append(art)
+    return frame
+  }
+
+  /// Encodes an integer as a 4-byte synchsafe integer (7 bits per byte).
+  private static func synchsafeSize(_ size: UInt32) -> [UInt8] {
+    [
+      UInt8((size >> 21) & 0x7F),
+      UInt8((size >> 14) & 0x7F),
+      UInt8((size >> 7) & 0x7F),
+      UInt8(size & 0x7F),
+    ]
+  }
+
+  /// Builds a 10-byte frame header: 4-char ID + 4-byte big-endian size + 2 flag bytes.
+  private static func frameHeader(id: String, size: UInt32) -> Data {
+    var header = Data(id.utf8)
+    header.append(UInt8((size >> 24) & 0xFF))
+    header.append(UInt8((size >> 16) & 0xFF))
+    header.append(UInt8((size >> 8) & 0xFF))
+    header.append(UInt8(size & 0xFF))
+    header.append(contentsOf: [0x00, 0x00])  // No flags
+    return header
   }
 }
 

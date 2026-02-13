@@ -177,3 +177,118 @@ import Testing
 
   #expect(frameCount == 0)
 }
+
+// MARK: - ID3 Tag Tests
+
+@Test func id3TagGeneration() {
+  let tag = ID3Tag(title: "Test Song", artist: "Test Artist", album: "Test Album")
+  let options = MP3EncoderOptions(id3Tag: tag)
+  let encoder = MP3Encoder(options: options)
+  let session = encoder.newSession()
+
+  let data = session.generateID3Tag()
+  #expect(data.count > 0)
+
+  // Should start with "ID3"
+  #expect(data[0] == 0x49) // 'I'
+  #expect(data[1] == 0x44) // 'D'
+  #expect(data[2] == 0x33) // '3'
+
+  // Version should be 2.3
+  #expect(data[3] == 0x03)
+  #expect(data[4] == 0x00)
+
+  // Verify frame IDs are present in the tag data
+  let bytes = [UInt8](data)
+  let containsTIT2 = bytes.indices.contains { i in
+    i + 4 <= bytes.count && bytes[i] == 0x54 && bytes[i+1] == 0x49 && bytes[i+2] == 0x54 && bytes[i+3] == 0x32
+  }
+  let containsTPE1 = bytes.indices.contains { i in
+    i + 4 <= bytes.count && bytes[i] == 0x54 && bytes[i+1] == 0x50 && bytes[i+2] == 0x45 && bytes[i+3] == 0x31
+  }
+  let containsTALB = bytes.indices.contains { i in
+    i + 4 <= bytes.count && bytes[i] == 0x54 && bytes[i+1] == 0x41 && bytes[i+2] == 0x4C && bytes[i+3] == 0x42
+  }
+  #expect(containsTIT2)
+  #expect(containsTPE1)
+  #expect(containsTALB)
+}
+
+@Test func encodeToFileWithID3() async throws {
+  let tag = ID3Tag(title: "My Song", artist: "Artist", album: "Album")
+  let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo, id3Tag: tag)
+  let encoder = MP3Encoder(options: options)
+
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent("test_id3_\(UUID().uuidString).mp3")
+  defer { try? FileManager.default.removeItem(at: url) }
+
+  let source = AsyncStream<[Float]> { continuation in
+    for chunkIndex in 0..<4 {
+      var samples = [Float]()
+      for i in 0..<1152 {
+        let sampleIndex = chunkIndex * 1152 + i
+        let t = Float(sampleIndex) / 44_100.0
+        let value = sin(2.0 * .pi * 440.0 * t) * 0.5
+        samples.append(value)
+        samples.append(value)
+      }
+      continuation.yield(samples)
+    }
+    continuation.finish()
+  }
+
+  try await encoder.encode(source, to: url)
+
+  let data = try Data(contentsOf: url)
+  #expect(data.count > 0)
+
+  // File should start with "ID3"
+  #expect(data[0] == 0x49) // 'I'
+  #expect(data[1] == 0x44) // 'D'
+  #expect(data[2] == 0x33) // '3'
+
+  // Parse the ID3 tag size to find where audio starts
+  let tagSize = (Int(data[6]) << 21) | (Int(data[7]) << 14) | (Int(data[8]) << 7) | Int(data[9])
+  let audioStart = 10 + tagSize
+
+  // Xing/Info header should follow the ID3 tag
+  let xingPrefix = [UInt8](data[audioStart..<min(audioStart + 256, data.count)])
+  let infoTag = [UInt8]("Info".utf8)
+  let xingTag = [UInt8]("Xing".utf8)
+  let containsXing = xingPrefix.indices.contains { i in
+    i + 4 <= xingPrefix.count && (Array(xingPrefix[i..<i+4]) == infoTag || Array(xingPrefix[i..<i+4]) == xingTag)
+  }
+  #expect(containsXing)
+}
+
+@Test func id3TagWithAlbumArt() {
+  // Create a small fake JPEG (just the header bytes for testing)
+  let fakeJPEG = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10] + Array(repeating: UInt8(0), count: 100))
+  let tag = ID3Tag(title: "Art Track", albumArt: fakeJPEG, albumArtMIMEType: "image/jpeg")
+  let data = ID3TagWriter.build(tag: tag)
+
+  #expect(data.count > 0)
+  #expect(data[0] == 0x49) // 'I'
+
+  // Verify APIC frame is present
+  let bytes = [UInt8](data)
+  let containsAPIC = bytes.indices.contains { i in
+    i + 4 <= bytes.count && bytes[i] == 0x41 && bytes[i+1] == 0x50 && bytes[i+2] == 0x49 && bytes[i+3] == 0x43
+  }
+  #expect(containsAPIC)
+
+  // The tag should contain the image data
+  #expect(data.count > fakeJPEG.count)
+}
+
+@Test func id3EmptyFields() {
+  let tag = ID3Tag()
+  let data = ID3TagWriter.build(tag: tag)
+  #expect(data.isEmpty)
+
+  // EncoderSession with no tag also returns empty
+  let options = MP3EncoderOptions()
+  let encoder = MP3Encoder(options: options)
+  let session = encoder.newSession()
+  #expect(session.generateID3Tag().isEmpty)
+}
