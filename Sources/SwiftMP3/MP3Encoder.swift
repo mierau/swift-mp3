@@ -243,6 +243,8 @@ public struct EncoderSession {
   private var pcmBuffer: [Float] = []
   private var vbrState = VBRState()
   private var reservoir = BitReservoir()
+  private var bufferedFrame: BufferedFrame? = nil
+  private var paddingRemainder: Int = 0
 
   private var filterbankBuffers: [[Float]] = []
   private var mdctOverlap: [[[Float]]] = []
@@ -279,6 +281,12 @@ public struct EncoderSession {
     self.frameSizes.reserveCapacity(10000)
   }
 
+  /// A buffered frame awaiting its main data slot to be filled from the reservoir.
+  private struct BufferedFrame {
+    let headerAndSideInfo: Data
+    let slotSize: Int
+  }
+
   /// Appends interleaved PCM samples to the internal buffer and encodes any complete frames.
   ///
   /// Samples should be interleaved for stereo (L, R, L, R, ...) and normalized to [-1.0, 1.0].
@@ -301,24 +309,44 @@ public struct EncoderSession {
     return output
   }
 
-  /// Encodes any remaining buffered samples as a final frame, zero-padding if necessary.
+  /// Encodes any remaining buffered samples and emits the final buffered frame.
   ///
   /// Call this once after all samples have been passed to ``encode(samples:)``.
+  /// Handles both leftover PCM samples and the one-frame delay from buffering.
   ///
-  /// - Returns: Encoded MP3 data for the final frame, or empty data if the buffer was empty.
+  /// - Returns: Encoded MP3 data for any remaining frames, or empty data if nothing was buffered.
   public mutating func flush() -> Data {
-    if self.pcmBuffer.isEmpty {
-      return Data()
+    var output = Data()
+
+    // Encode remaining PCM as a self-contained final frame
+    if !self.pcmBuffer.isEmpty {
+      let channels = self.options.mode == .mono ? 1 : 2
+      let frameSampleCount = Self.samplesPerFrame * channels
+      let needed = frameSampleCount - self.pcmBuffer.count
+      if needed > 0 {
+        self.pcmBuffer.append(contentsOf: repeatElement(0, count: needed))
+      }
+      let frameSamples = self.pcmBuffer
+      self.pcmBuffer.removeAll()
+      output.append(self.encodeFrame(samples: frameSamples, isFinal: true))
     }
-    let channels = self.options.mode == .mono ? 1 : 2
-    let frameSampleCount = Self.samplesPerFrame * channels
-    let needed = frameSampleCount - self.pcmBuffer.count
-    if needed > 0 {
-      self.pcmBuffer.append(contentsOf: repeatElement(0, count: needed))
+
+    // Emit the final buffered frame
+    if let prev = self.bufferedFrame {
+      let slotData = self.reservoir.fillSlot(slotSize: prev.slotSize)
+      var frame = Data()
+      frame.append(prev.headerAndSideInfo)
+      frame.append(slotData)
+
+      self.frameCount += 1
+      self.totalBytes += UInt32(frame.count)
+      self.frameSizes.append(frame.count)
+
+      output.append(frame)
+      self.bufferedFrame = nil
     }
-    let frameSamples = self.pcmBuffer
-    self.pcmBuffer.removeAll()
-    return self.encodeFrame(samples: frameSamples)
+
+    return output
   }
 
   /// Generates the ID3v2.3 tag data for the configured metadata.
@@ -420,8 +448,31 @@ public struct EncoderSession {
     return toc
   }
 
+  /// Determines whether this frame should include a padding byte.
+  ///
+  /// Accumulates the fractional-byte remainder from the frame size calculation.
+  /// When the accumulator reaches the sample rate, a padding byte is added and
+  /// the accumulator wraps, distributing padding evenly over time.
+  private mutating func shouldPad(remainder: Int, sampleRate: Int) -> Bool {
+    self.paddingRemainder += remainder
+    if self.paddingRemainder >= sampleRate {
+      self.paddingRemainder -= sampleRate
+      return true
+    }
+    return false
+  }
+
   /// Encodes a single MPEG-1 Layer III frame from PCM samples.
-  private mutating func encodeFrame(samples: [Float]) -> Data {
+  ///
+  /// Uses one-frame buffering: the returned data contains the *previous* frame
+  /// (with its main data slot filled from the reservoir), while the current
+  /// frame is buffered until the next call or ``flush()``.
+  ///
+  /// - Parameters:
+  ///   - samples: One frame of interleaved PCM samples.
+  ///   - isFinal: When `true`, disables reservoir borrowing to prevent stranded data.
+  /// - Returns: The previously buffered frame's data, or empty data for the first call.
+  private mutating func encodeFrame(samples: [Float], isFinal: Bool = false) -> Data {
     let channels = self.options.mode == .mono ? 1 : 2
     let frameEnergy = FrameAnalysis.energy(samples: samples)
     let targetBitrate = self.options.vbr
@@ -431,17 +482,44 @@ public struct EncoderSession {
     let sampleRateIndex = MP3Tables.sampleRateIndex(for: self.options.sampleRate)
 
     let bitrateValue = MP3Tables.bitrateValue(for: bitrateIndex)
-    let baseFrameSize = (144 * bitrateValue * 1000) / self.options.sampleRate
     let sideInfoSize = channels == 1 ? 17 : 32
     let headerSize = 4
     let crcSize = self.options.crcProtected ? 2 : 0
-    let padding = 0
+
+    // Dynamic frame padding
+    let numerator = 144 * bitrateValue * 1000
+    let baseFrameSize = numerator / self.options.sampleRate
+    let remainder = numerator % self.options.sampleRate
+    let pad = self.shouldPad(remainder: remainder, sampleRate: self.options.sampleRate)
+    let padding = pad ? 1 : 0
     let frameSize = baseFrameSize + padding
     let mainDataSize = frameSize - headerSize - crcSize - sideInfoSize
 
-    let (modeBits, modeExtension) = MP3Tables.modeBits(for: self.options.mode)
+    // Snapshot reservoir state before encoding
+    let mainDataBegin = isFinal ? 0 : self.reservoir.mainDataBegin
+    let reservoirBitsAvailable = isFinal ? 0 : self.reservoir.availableBytes * 8
 
-    // MPEG-1 Layer III frame header
+    // Encode audio into raw Huffman data
+    let (huffmanData, granules, scfsi) = self.buildMainData(
+      samples: samples,
+      channels: channels,
+      targetMainDataSize: mainDataSize,
+      reservoirBitsAvailable: reservoirBitsAvailable
+    )
+
+    // Add Huffman data to reservoir stream
+    self.reservoir.appendHuffmanData(huffmanData)
+
+    // Build side info with actual main_data_begin
+    let sideInfo = self.buildSideInfo(
+      channels: channels,
+      granules: granules,
+      scfsi: scfsi,
+      mainDataBegin: mainDataBegin
+    )
+
+    // Build frame header
+    let (modeBits, modeExtension) = MP3Tables.modeBits(for: self.options.mode)
     var header = BitstreamWriter()
     header.write(bits: 0x7FF, count: 11)
     header.write(bits: 0b11, count: 2)
@@ -457,42 +535,45 @@ public struct EncoderSession {
     header.write(bits: self.options.original ? 1 : 0, count: 1)
     header.write(bits: 0, count: 2)
 
-    let (mainData, sideInfo) = self.buildMainData(
-      samples: samples,
-      channels: channels,
-      targetMainDataSize: mainDataSize
+    var headerAndSideInfo = Data()
+    headerAndSideInfo.append(header.data)
+    if self.options.crcProtected {
+      let crc = CRC16.mpeg(data: headerAndSideInfo)
+      headerAndSideInfo.append(contentsOf: [UInt8(crc >> 8), UInt8(crc & 0xFF)])
+    }
+    headerAndSideInfo.append(sideInfo)
+
+    // Emit previous buffered frame with its slot filled from the reservoir
+    var emitted = Data()
+    if let prev = self.bufferedFrame {
+      let slotData = self.reservoir.fillSlot(slotSize: prev.slotSize)
+      emitted.append(prev.headerAndSideInfo)
+      emitted.append(slotData)
+
+      self.frameCount += 1
+      self.totalBytes += UInt32(emitted.count)
+      self.frameSizes.append(emitted.count)
+    }
+
+    // Buffer current frame for emission on the next call
+    self.bufferedFrame = BufferedFrame(
+      headerAndSideInfo: headerAndSideInfo,
+      slotSize: mainDataSize
     )
 
-    var frame = Data()
-    frame.append(header.data)
-    if self.options.crcProtected {
-      let crc = CRC16.mpeg(data: frame)
-      frame.append(contentsOf: [UInt8(crc >> 8), UInt8(crc & 0xFF)])
-    }
-    frame.append(sideInfo)
+    // Update reservoir counter
+    self.reservoir.updateReservoir(huffmanBytes: huffmanData.count, slotSize: mainDataSize)
 
-    var paddedMainData = mainData
-    if paddedMainData.count < mainDataSize {
-      paddedMainData.append(contentsOf: repeatElement(0, count: mainDataSize - paddedMainData.count))
-    } else if paddedMainData.count > mainDataSize {
-      paddedMainData = paddedMainData.prefix(mainDataSize)
-    }
-    frame.append(paddedMainData)
-
-    self.frameCount += 1
-    self.totalBytes += UInt32(frame.count)
-    self.frameSizes.append(frame.count)
-
-    return frame
+    return emitted
   }
 
   /// Builds the MPEG-1 Layer III side information for a frame.
-  private func buildSideInfo(channels: Int, granules: [[GranuleInfo]], scfsi: [[Int]]) -> Data {
+  private func buildSideInfo(channels: Int, granules: [[GranuleInfo]], scfsi: [[Int]], mainDataBegin: Int = 0) -> Data {
     var writer = BitstreamWriter()
     let sideInfoBits = channels == 1 ? 136 : 256
 
-    // main_data_begin = 0 (no bit reservoir, each frame is self-contained)
-    writer.write(bits: 0, count: 9)
+    // main_data_begin: byte offset into previous frames' main data
+    writer.write(bits: min(mainDataBegin, 511), count: 9)
 
     let privateBits = channels == 1 ? 5 : 3
     writer.write(bits: 0, count: privateBits)
@@ -543,12 +624,13 @@ public struct EncoderSession {
     return data
   }
 
-  /// Builds the main data and side information for a single frame.
+  /// Builds the raw Huffman data, granule info, and scfsi for a single frame.
   private mutating func buildMainData(
     samples: [Float],
     channels: Int,
-    targetMainDataSize: Int
-  ) -> (Data, Data) {
+    targetMainDataSize: Int,
+    reservoirBitsAvailable: Int = 0
+  ) -> (Data, [[GranuleInfo]], [[Int]]) {
     let perChannel = self.deinterleave(samples: samples, channels: channels)
     let stereoDecision = StereoDecision.make(
       mode: self.options.mode,
@@ -562,7 +644,8 @@ public struct EncoderSession {
     let scfsi = Array(repeating: Array(repeating: 0, count: 4), count: channels)
     var writer = BitstreamWriter()
 
-    let totalMainDataBits = targetMainDataSize * 8
+    let usableReservoirBits = (reservoirBitsAvailable * 9) / 10  // 90% safety margin
+    let totalMainDataBits = (targetMainDataSize * 8) + usableReservoirBits
     let granuleCount = 2 * channels
     let bitsPerGranule = totalMainDataBits / granuleCount
 
@@ -644,9 +727,7 @@ public struct EncoderSession {
     }
 
     writer.padToByte()
-    let mainData = self.reservoir.consume(with: writer.data)
-    let sideInfo = self.buildSideInfo(channels: channels, granules: granules, scfsi: scfsi)
-    return (mainData, sideInfo)
+    return (writer.data, granules, scfsi)
   }
 
   /// Iteratively adjusts global gain to quantize spectral data within a bit budget.
@@ -2003,13 +2084,47 @@ private struct GranuleInfo {
   var count1TableSelect: Int = 0
 }
 
-/// Simplified bit reservoir that keeps each frame self-contained (main_data_begin = 0).
+/// Bit reservoir for MPEG-1 Layer III cross-frame byte sharing.
+///
+/// Maintains a contiguous Huffman byte stream. Simple frames bank unused slot
+/// bytes so complex frames can borrow them (up to 511 bytes, the 9-bit limit).
 private struct BitReservoir {
-  private(set) var mainDataBegin: Int = 0
+  /// Contiguous Huffman byte stream awaiting placement into frame slots.
+  private(set) var stream = Data()
 
-  /// Returns the main data unchanged. No cross-frame buffering is used.
-  mutating func consume(with mainData: Data) -> Data {
-    return mainData
+  /// Reservoir counter tracking free space available for borrowing (bytes).
+  private(set) var availableBytes: Int = 0
+
+  /// The `main_data_begin` pointer for the current frame, capped at the 9-bit max.
+  var mainDataBegin: Int {
+    min(stream.count, 511)
+  }
+
+  /// Appends freshly encoded Huffman data to the stream.
+  mutating func appendHuffmanData(_ data: Data) {
+    stream.append(data)
+  }
+
+  /// Extracts exactly `slotSize` bytes from the front of the stream.
+  /// Zero-pads if the stream has fewer bytes than needed.
+  mutating func fillSlot(slotSize: Int) -> Data {
+    if stream.count >= slotSize {
+      let slot = Data(stream.prefix(slotSize))
+      stream.removeFirst(slotSize)
+      return slot
+    } else {
+      var slot = stream
+      slot.append(contentsOf: repeatElement(UInt8(0), count: slotSize - slot.count))
+      stream.removeAll()
+      return slot
+    }
+  }
+
+  /// Updates the reservoir counter after encoding a frame.
+  /// Positive delta means the frame banked bytes; negative means it borrowed.
+  mutating func updateReservoir(huffmanBytes: Int, slotSize: Int) {
+    availableBytes += slotSize - huffmanBytes
+    availableBytes = min(max(availableBytes, 0), 511)
   }
 }
 
