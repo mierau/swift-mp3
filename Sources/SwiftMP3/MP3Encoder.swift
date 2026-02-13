@@ -4,22 +4,42 @@
 import Foundation
 import Accelerate
 
+/// Configuration options for the MP3 encoder.
 public struct MP3EncoderOptions: Sendable, Equatable {
+  /// The channel mode for the encoded audio.
   public enum Mode: String, Sendable, Equatable {
     case mono
     case stereo
     case jointStereo
   }
 
+  /// Sample rate in Hz (e.g. 44100, 48000, 32000).
   public var sampleRate: Int
+  /// Target bitrate in kbps for CBR, or base bitrate for VBR.
   public var bitrateKbps: Int
+  /// Whether to use variable bitrate encoding.
   public var vbr: Bool
+  /// Channel mode (mono, stereo, or joint stereo).
   public var mode: Mode
+  /// Encoding quality from 0 (highest) to 9 (lowest).
   public var quality: Int
+  /// Whether to include CRC error protection in each frame.
   public var crcProtected: Bool
+  /// Whether to set the original bit in the frame header.
   public var original: Bool
+  /// Whether to set the copyright bit in the frame header.
   public var copyright: Bool
 
+  /// Creates a new set of encoder options.
+  /// - Parameters:
+  ///   - sampleRate: Sample rate in Hz. Defaults to 44100.
+  ///   - bitrateKbps: Target bitrate in kbps. Defaults to 128.
+  ///   - vbr: Enable variable bitrate encoding. Defaults to `false`.
+  ///   - mode: Channel mode. Defaults to `.stereo`.
+  ///   - quality: Quality level from 0 (best) to 9 (smallest). Defaults to 5.
+  ///   - crcProtected: Enable CRC protection. Defaults to `false`.
+  ///   - original: Set the original flag. Defaults to `true`.
+  ///   - copyright: Set the copyright flag. Defaults to `false`.
   public init(
     sampleRate: Int = 44_100,
     bitrateKbps: Int = 128,
@@ -41,6 +61,18 @@ public struct MP3EncoderOptions: Sendable, Equatable {
   }
 }
 
+/// MPEG-1 Layer III (MP3) encoder.
+///
+/// Encodes interleaved PCM float samples into MP3 frames. Supports CBR and VBR encoding
+/// with mono, stereo, and joint stereo modes.
+///
+/// Usage:
+/// ```swift
+/// let encoder = MP3Encoder(options: MP3EncoderOptions())
+/// var mp3Data = encoder.appendSamples(pcmSamples)
+/// mp3Data.append(encoder.flush())
+/// let finalData = encoder.makeXingHeader() + mp3Data
+/// ```
 @preconcurrency
 public final class MP3Encoder {
   private static let samplesPerFrame = 1152
@@ -52,49 +84,48 @@ public final class MP3Encoder {
   private var vbrState = VBRState()
   private var reservoir = BitReservoir()
 
-  // Polyphase filterbank state: 512-sample buffer per channel
   private var filterbankBuffers: [[Float]] = []
-  // MDCT overlap: 18 samples per subband per channel
   private var mdctOverlap: [[[Float]]] = []
 
-  // Pre-allocated working buffers to reduce allocations
   private var workingSpectrum: [Float] = []
   private var workingQuantized: [Int] = []
   private var workingSubbands: [[Float]] = []
 
-  // Xing header tracking
   private var frameCount: UInt32 = 0
   private var totalBytes: UInt32 = 0
-  private var frameSizes: [Int] = []  // For TOC generation
+  private var frameSizes: [Int] = []
 
-  /// Returns the number of frames encoded so far.
+  /// The number of frames encoded so far.
   public var encodedFrameCount: UInt32 { frameCount }
 
-  /// Returns the total bytes of audio data encoded so far (excluding Xing header).
+  /// The total bytes of encoded audio data so far (excluding the Xing header).
   public var encodedByteCount: UInt32 { totalBytes }
 
+  /// Creates a new MP3 encoder with the given options.
+  /// - Parameter options: Configuration for sample rate, bitrate, channel mode, etc.
   public init(options: MP3EncoderOptions) {
     self.options = options
     let channels = options.mode == .mono ? 1 : 2
 
-    // Initialize polyphase filterbank buffers (512 samples each)
     self.filterbankBuffers = Array(repeating: Array(repeating: 0, count: 512), count: channels)
-
-    // Initialize MDCT overlap buffers (18 samples per subband per channel)
     self.mdctOverlap = Array(
       repeating: Array(repeating: Array(repeating: 0, count: 18), count: Self.subbands),
       count: channels
     )
 
-    // Pre-allocate working buffers
     self.workingSpectrum = [Float](repeating: 0, count: Self.samplesPerGranule)
     self.workingQuantized = [Int](repeating: 0, count: Self.samplesPerGranule)
     self.workingSubbands = Array(repeating: [Float](repeating: 0, count: 18), count: Self.subbands)
-
-    // Reserve space for frame sizes (estimate based on typical file lengths)
     self.frameSizes.reserveCapacity(10000)
   }
 
+  /// Appends interleaved PCM samples to the internal buffer and encodes any complete frames.
+  ///
+  /// Samples should be interleaved for stereo (L, R, L, R, ...) and normalized to [-1.0, 1.0].
+  /// Any leftover samples that don't fill a complete frame are buffered for the next call.
+  ///
+  /// - Parameter samples: Interleaved PCM float samples.
+  /// - Returns: Encoded MP3 data for any complete frames, or empty data if no frames were completed.
   public func appendSamples(_ samples: [Float]) -> Data {
     self.pcmBuffer.append(contentsOf: samples)
     var output = Data()
@@ -110,6 +141,11 @@ public final class MP3Encoder {
     return output
   }
 
+  /// Encodes any remaining buffered samples as a final frame, zero-padding if necessary.
+  ///
+  /// Call this once after all samples have been passed to ``appendSamples(_:)``.
+  ///
+  /// - Returns: Encoded MP3 data for the final frame, or empty data if the buffer was empty.
   public func flush() -> Data {
     if self.pcmBuffer.isEmpty {
       return Data()
@@ -125,14 +161,17 @@ public final class MP3Encoder {
     return self.encodeFrame(samples: frameSamples)
   }
 
-  /// Generates a Xing/Info header frame to prepend to the MP3 data.
-  /// Call this after encoding is complete to get accurate frame/byte counts.
-  /// The returned data should be prepended to the encoded audio data.
+  /// Generates a Xing/Info header frame for seeking and duration metadata.
+  ///
+  /// Call this after encoding is complete to get accurate frame and byte counts.
+  /// The returned data should be prepended to the encoded audio data. Uses the
+  /// "Xing" tag for VBR and "Info" tag for CBR streams.
+  ///
+  /// - Returns: A complete MP3 frame containing the Xing/Info header.
   public func makeXingHeader() -> Data {
     let channels = self.options.mode == .mono ? 1 : 2
     let sideInfoSize = channels == 1 ? 17 : 32
 
-    // Use the base bitrate for the Xing frame (common practice)
     let bitrateIndex = MP3Tables.bitrateIndex(for: self.options.bitrateKbps, sampleRate: self.options.sampleRate)
     let sampleRateIndex = MP3Tables.sampleRateIndex(for: self.options.sampleRate)
     let bitrateValue = MP3Tables.bitrateValue(for: bitrateIndex)
@@ -140,9 +179,9 @@ public final class MP3Encoder {
 
     let (modeBits, modeExtension) = MP3Tables.modeBits(for: self.options.mode)
 
-    // Build MP3 frame header
+    // MPEG-1 Layer III frame header
     var header = BitstreamWriter()
-    header.write(bits: 0x7FF, count: 11)  // Sync
+    header.write(bits: 0x7FF, count: 11)   // Sync word
     header.write(bits: 0b11, count: 2)     // MPEG Version 1
     header.write(bits: 0b01, count: 2)     // Layer III
     header.write(bits: 1, count: 1)        // No CRC
@@ -158,51 +197,41 @@ public final class MP3Encoder {
 
     var frame = Data()
     frame.append(header.data)
-
-    // Empty side info (zeroed)
     frame.append(contentsOf: repeatElement(UInt8(0), count: sideInfoSize))
 
-    // Xing header content
-    // Use "Xing" for VBR, "Info" for CBR (though both work)
     let tag = self.options.vbr ? "Xing" : "Info"
     frame.append(contentsOf: tag.utf8)
 
-    // Flags: frames present (0x01), bytes present (0x02), TOC present (0x04)
+    // Flags: frames present, bytes present, TOC present
     let flags: UInt32 = 0x07
     frame.append(contentsOf: flags.bigEndianBytes)
 
-    // Frame count (including this Xing frame)
     let totalFrames = self.frameCount + 1
     frame.append(contentsOf: totalFrames.bigEndianBytes)
 
-    // Byte count (including this Xing frame)
     let xingFrameSize = UInt32(frameSize)
     let totalByteCount = self.totalBytes + xingFrameSize
     frame.append(contentsOf: totalByteCount.bigEndianBytes)
 
-    // TOC (Table of Contents) - 100 bytes
-    // Maps percentage (0-99) to byte position as fraction of file (0-255)
     let toc = self.generateTOC()
     frame.append(contentsOf: toc)
 
-    // Pad frame to full size
-    let currentSize = frame.count
-    if currentSize < frameSize {
-      frame.append(contentsOf: repeatElement(UInt8(0), count: frameSize - currentSize))
+    if frame.count < frameSize {
+      frame.append(contentsOf: repeatElement(UInt8(0), count: frameSize - frame.count))
     }
 
     return frame
   }
 
   /// Generates the 100-byte TOC (Table of Contents) for seeking.
-  /// Each entry maps a percentage (0-99%) to a byte position (0-255 scale).
+  ///
+  /// Each entry maps a percentage point (0-99%) to a byte position scaled to 0-255.
+  /// Falls back to a linear distribution if no frames have been encoded.
   private func generateTOC() -> [UInt8] {
     guard !self.frameSizes.isEmpty else {
-      // No frames encoded, return linear TOC
       return (0..<100).map { UInt8($0 * 255 / 99) }
     }
 
-    // Calculate cumulative byte positions
     var cumulative = [Int]()
     var sum = 0
     for size in self.frameSizes {
@@ -215,7 +244,6 @@ public final class MP3Encoder {
       return (0..<100).map { UInt8($0 * 255 / 99) }
     }
 
-    // For each percentage point, find the byte position
     var toc = [UInt8]()
     for percent in 0..<100 {
       let targetFrame = (percent * self.frameSizes.count) / 100
@@ -227,6 +255,10 @@ public final class MP3Encoder {
     return toc
   }
   
+  /// Encodes a single MPEG-1 Layer III frame from PCM samples.
+  ///
+  /// - Parameter samples: Interleaved PCM samples for one frame (1152 samples per channel).
+  /// - Returns: A complete MP3 frame including header, side information, and main data.
   private func encodeFrame(samples: [Float]) -> Data {
     let channels = self.options.mode == .mono ? 1 : 2
     let frameEnergy = FrameAnalysis.energy(samples: samples)
@@ -236,21 +268,18 @@ public final class MP3Encoder {
     let bitrateIndex = MP3Tables.bitrateIndex(for: targetBitrate, sampleRate: self.options.sampleRate)
     let sampleRateIndex = MP3Tables.sampleRateIndex(for: self.options.sampleRate)
 
-    // Calculate frame size: floor(144 * bitrate / sampleRate) + padding
-    // For MPEG-1 Layer III
     let bitrateValue = MP3Tables.bitrateValue(for: bitrateIndex)
     let baseFrameSize = (144 * bitrateValue * 1000) / self.options.sampleRate
     let sideInfoSize = channels == 1 ? 17 : 32
     let headerSize = 4
     let crcSize = self.options.crcProtected ? 2 : 0
-
-    // Determine if padding is needed (for this simple implementation, no padding)
     let padding = 0
     let frameSize = baseFrameSize + padding
     let mainDataSize = frameSize - headerSize - crcSize - sideInfoSize
 
     let (modeBits, modeExtension) = MP3Tables.modeBits(for: self.options.mode)
 
+    // MPEG-1 Layer III frame header
     var header = BitstreamWriter()
     header.write(bits: 0x7FF, count: 11)
     header.write(bits: 0b11, count: 2)
@@ -280,7 +309,6 @@ public final class MP3Encoder {
     }
     frame.append(sideInfo)
 
-    // Pad or truncate main data to exact size
     var paddedMainData = mainData
     if paddedMainData.count < mainDataSize {
       paddedMainData.append(contentsOf: repeatElement(0, count: mainDataSize - paddedMainData.count))
@@ -289,7 +317,6 @@ public final class MP3Encoder {
     }
     frame.append(paddedMainData)
 
-    // Track for Xing header
     self.frameCount += 1
     self.totalBytes += UInt32(frame.count)
     self.frameSizes.append(frame.count)
@@ -297,32 +324,33 @@ public final class MP3Encoder {
     return frame
   }
   
+  /// Builds the MPEG-1 Layer III side information for a frame.
+  ///
+  /// Side information is 17 bytes for mono or 32 bytes for stereo and contains
+  /// granule parameters (gain, Huffman table selection, region boundaries, etc.)
+  /// needed by the decoder to interpret the main data.
+  ///
+  /// - Parameters:
+  ///   - channels: Number of audio channels (1 or 2).
+  ///   - granules: Granule parameters indexed as `[granule][channel]`.
+  ///   - scfsi: Scale factor selection info indexed as `[channel][band]`.
+  /// - Returns: Serialized side information data.
   private func buildSideInfo(channels: Int, granules: [[GranuleInfo]], scfsi: [[Int]]) -> Data {
     var writer = BitstreamWriter()
-
-    // Side info size: 17 bytes (136 bits) for mono, 32 bytes (256 bits) for stereo
     let sideInfoBits = channels == 1 ? 136 : 256
 
-    // MPEG-1 Layer III side information structure:
-    // - main_data_begin: 9 bits (byte offset back from frame sync)
-    // - private_bits: 5 bits (mono) or 3 bits (stereo)
-    // - scfsi[ch][band]: 1 bit × 4 bands × channels
-    // - granule info for 2 granules × channels
-
-    // Use 0 for main_data_begin (no bit reservoir - simpler and more compatible)
+    // main_data_begin = 0 (no bit reservoir, each frame is self-contained)
     writer.write(bits: 0, count: 9)
 
-    // Private bits
     let privateBits = channels == 1 ? 5 : 3
     writer.write(bits: 0, count: privateBits)
 
-    // Scale factor selection information (scfsi) - 4 bits per channel
     for ch in 0..<channels {
       for scfsiBand in 0..<4 {
         writer.write(bits: scfsi[ch][scfsiBand], count: 1)
       }
     }
-    
+
     for gr in 0..<2 {
       for ch in 0..<channels {
         let info = granules[gr][ch]
@@ -351,7 +379,7 @@ public final class MP3Encoder {
         writer.write(bits: info.count1TableSelect, count: 1)
       }
     }
-    
+
     writer.padToByte()
     let data = writer.data
     if data.count * 8 < sideInfoBits {
@@ -363,6 +391,16 @@ public final class MP3Encoder {
     return data
   }
   
+  /// Builds the main data and side information for a single frame.
+  ///
+  /// Processes samples through the full encoding pipeline: deinterleaving, stereo processing,
+  /// polyphase filterbank, MDCT, psychoacoustic analysis, quantization, and Huffman coding.
+  ///
+  /// - Parameters:
+  ///   - samples: Interleaved PCM samples for the frame.
+  ///   - channels: Number of audio channels.
+  ///   - targetMainDataSize: Target size in bytes for the main data section.
+  /// - Returns: A tuple of (main data, side information) as serialized bytes.
   private func buildMainData(
     samples: [Float],
     channels: Int,
@@ -381,17 +419,14 @@ public final class MP3Encoder {
     let scfsi = Array(repeating: Array(repeating: 0, count: 4), count: channels)
     var writer = BitstreamWriter()
 
-    // Calculate bit budget per granule
     let totalMainDataBits = targetMainDataSize * 8
     let granuleCount = 2 * channels
     let bitsPerGranule = totalMainDataBits / granuleCount
 
-    // MP3 Layer III has 2 granules per frame, each with 576 samples per channel
     for granuleIndex in 0..<2 {
       for channelIndex in 0..<channels {
         let channelSamples = stereoDecision.samples(for: channelIndex)
 
-        // Extract samples for this granule (576 samples)
         let granuleStart = granuleIndex * Self.samplesPerGranule
         let granuleEnd = min(granuleStart + Self.samplesPerGranule, channelSamples.count)
         let granuleSamples: [Float]
@@ -401,7 +436,6 @@ public final class MP3Encoder {
           granuleSamples = Array(repeating: 0, count: Self.samplesPerGranule)
         }
 
-        // Encode through polyphase filterbank + MDCT
         let spectrum = self.encodeSpectrum(
           granuleSamples,
           channel: channelIndex,
@@ -413,7 +447,6 @@ public final class MP3Encoder {
           energy: FrameAnalysis.energy(samples: granuleSamples)
         )
 
-        // Iterate on global_gain to fit bit budget (like real encoders)
         let (finalGain, quantized, huffmanBits) = self.quantizeToFitBudget(
           spectral: spectrum.spectral,
           scalefactors: spectrum.scalefactors,
@@ -423,7 +456,6 @@ public final class MP3Encoder {
           writer: &writer
         )
 
-        // Use scalefac_compress = 0, which means slen1=0, slen2=0
         let scalefacCompress = 0
 
         let preflag = PreEmphasis.shouldEnable(
@@ -431,7 +463,6 @@ public final class MP3Encoder {
           scalefactors: spectrum.scalefactors
         ) ? 1 : 0
 
-        // Find bigValues from quantized data
         var lastNonZero = 0
         for i in stride(from: quantized.count - 1, through: 0, by: -1) {
           if quantized[i] != 0 {
@@ -442,15 +473,11 @@ public final class MP3Encoder {
         let significantCount = (lastNonZero + 1) & ~1
         let bigValues = min(significantCount / 2, 288)
 
-        // Calculate region boundaries based on bigValues
         let (region0Count, region1Count) = self.calculateRegionCounts(
           bigValues: bigValues,
           sampleRate: self.options.sampleRate
         )
 
-        // Side info debug disabled - verified: bigValues ~141-143, region0Count=14, region1Count=2
-
-        // part2_3_length = scalefactor_bits + huffman_bits
         let part23Length = huffmanBits
 
         let info = GranuleInfo(
@@ -479,8 +506,19 @@ public final class MP3Encoder {
     return (mainData, sideInfo)
   }
 
-  /// Quantizes and encodes spectral data with gain adjustment to fit bit budget.
-  /// Returns (finalGain, quantizedValues, bitsWritten)
+  /// Iteratively adjusts global gain to quantize spectral data within a bit budget.
+  ///
+  /// Increases the global gain (coarser quantization) until the Huffman-coded output
+  /// fits within `maxBits`. This is the outer rate-control loop of the encoder.
+  ///
+  /// - Parameters:
+  ///   - spectral: MDCT spectral coefficients for one granule.
+  ///   - scalefactors: Per-coefficient scale factors.
+  ///   - thresholds: Psychoacoustic masking thresholds.
+  ///   - initialGain: Starting global gain value (0-255).
+  ///   - maxBits: Maximum bits available for this granule.
+  ///   - writer: Bitstream writer to append Huffman-coded data to.
+  /// - Returns: A tuple of (final global gain, quantized values, bits written).
   private func quantizeToFitBudget(
     spectral: [Float],
     scalefactors: [Float],
@@ -489,13 +527,7 @@ public final class MP3Encoder {
     maxBits: Int,
     writer: inout BitstreamWriter
   ) -> (Int, [Int], Int) {
-    var gain = initialGain
-
-    // Clamp gain to valid range
-    gain = min(max(gain, 0), 255)
-
-    // Iterate to find a gain that fits within bit budget
-    // Higher gain = larger quantizer step = smaller values = fewer bits
+    var gain = min(max(initialGain, 0), 255)
     var quantized = [Int]()
     var estimatedBits = 0
     let maxIterations = 20
@@ -503,7 +535,6 @@ public final class MP3Encoder {
     for iteration in 0..<maxIterations {
       quantized = self.quantizeWithGain(spectral: spectral, globalGain: gain)
 
-      // Find significant (non-zero) values
       var lastNonZero = 0
       for i in stride(from: quantized.count - 1, through: 0, by: -1) {
         if quantized[i] != 0 {
@@ -512,32 +543,26 @@ public final class MP3Encoder {
         }
       }
 
-      // If no non-zero values and we haven't reduced gain much, try lower gain
       if lastNonZero == 0 && iteration == 0 {
         gain = max(gain - 40, 0)
         continue
       }
 
-      // Count bits needed for this quantization
       let significantCount = min((lastNonZero + 1) & ~1, 576)
       let bigValues = min(significantCount / 2, 288)
       let valuesToCount = Array(quantized.prefix(bigValues * 2))
       estimatedBits = self.countHuffmanBits(valuesToCount)
 
-      // If we fit within budget, we're done
       if estimatedBits <= maxBits {
         break
       }
 
-      // Increase gain to reduce bit usage (larger step = smaller quantized values)
       gain = min(gain + 4, 255)
-
       if gain >= 255 {
         break
       }
     }
 
-    // Find final significant count
     var lastNonZero = 0
     for i in stride(from: quantized.count - 1, through: 0, by: -1) {
       if quantized[i] != 0 {
@@ -546,53 +571,47 @@ public final class MP3Encoder {
       }
     }
 
-    // Quantization debug disabled - verified working correctly
-    // Non-zero values concentrated in low frequencies (100-115 in indices 0-143, 0 in indices 432-575)
-
-    // Limit to what we can encode
     let significantCount = min((lastNonZero + 1) & ~1, 576)
     let bigValues = min(significantCount / 2, 288)
     let valuesToEncode = Array(quantized.prefix(bigValues * 2))
 
-    // Encode with Huffman
     let huffman = HuffmanEncoder()
     let actualBits = huffman.encodeWithTable15(valuesToEncode, writer: &writer)
 
     return (gain, quantized, actualBits)
   }
 
-  /// Quantize spectral data with a specific global gain using vectorized operations.
+  /// Quantizes spectral coefficients at a specific global gain using vectorized operations.
+  ///
+  /// Applies the ISO 11172-3 power-law quantization formula:
+  /// `ix = nint(|xr|^0.75 / 2^((global_gain - 210) / 4))`,
+  /// clamped to the range of Huffman table 15 (0-15).
+  ///
+  /// - Parameters:
+  ///   - spectral: MDCT spectral coefficients.
+  ///   - globalGain: Quantizer step size control (0-255).
+  /// - Returns: Signed quantized values preserving the original sign of each coefficient.
   private func quantizeWithGain(spectral: [Float], globalGain: Int) -> [Int] {
     let stepPower = Double(globalGain - 210) / 4.0
     let quantizerStep = Float(max(pow(2.0, stepPower), 0.0001))
     var invStep = 1.0 / quantizerStep
-
-    // Table 15 is a 16x16 table for values 0-15, no linbits
     let maxQuantized: Int32 = 15
     let count = spectral.count
 
-    // Get absolute values using vDSP
     var absValues = [Float](repeating: 0, count: count)
     vDSP_vabs(spectral, 1, &absValues, 1, vDSP_Length(count))
 
-    // Apply power of 0.75 using vForce
-    // pow(x, 0.75) = exp(0.75 * log(x))
-    // But vvpowf is simpler: vvpowf(result, exponent, base, count)
     var exponent = [Float](repeating: 0.75, count: count)
     var magnitudes = [Float](repeating: 0, count: count)
 
-    // Replace zeros with tiny values to avoid log(0)
     var threshold: Float = 1e-10
     vDSP_vthr(absValues, 1, &threshold, &absValues, 1, vDSP_Length(count))
 
-    // Vectorized power: magnitudes = absValues ^ 0.75
     vvpowf(&magnitudes, &exponent, absValues, [Int32(count)])
 
-    // Scale by inverse step and round
     var scaled = [Float](repeating: 0, count: count)
     vDSP_vsmul(magnitudes, 1, &invStep, &scaled, 1, vDSP_Length(count))
 
-    // Convert to integers with clamping
     var result = [Int](repeating: 0, count: count)
     for i in 0..<count {
       let quantized = min(Int32(scaled[i].rounded()), maxQuantized)
@@ -602,8 +621,13 @@ public final class MP3Encoder {
     return result
   }
 
-  /// Count huffman bits without writing (for iteration).
-  /// Table 15 is a 16x16 table for values 0-15, NO linbits.
+  /// Estimates the number of Huffman-coded bits for a set of quantized values without writing.
+  ///
+  /// Uses table 15 (16x16, no linbits) for bit counting. This is used during the
+  /// gain iteration loop to test whether a quantization fits the bit budget.
+  ///
+  /// - Parameter values: Quantized spectral values (pairs encoded together).
+  /// - Returns: Total estimated bit count including sign bits.
   private func countHuffmanBits(_ values: [Int]) -> Int {
     var bits = 0
     var index = 0
@@ -615,7 +639,6 @@ public final class MP3Encoder {
       let code = MP3Tables.table15.table[absX][absY]
       bits += code.length
 
-      // Sign bits (only if value is non-zero)
       if absX != 0 { bits += 1 }
       if absY != 0 { bits += 1 }
 
@@ -632,16 +655,19 @@ public final class MP3Encoder {
     return bits
   }
 
-  /// Calculates region0_count and region1_count based on bigValues.
-  /// These define where the three Huffman table regions end within the big_values area.
+  /// Calculates region boundary indices for Huffman table region selection.
+  ///
+  /// The big_values area of each granule is divided into three regions, each of which
+  /// can use a different Huffman table. The boundaries align to scalefactor band edges.
+  ///
+  /// - Parameters:
+  ///   - bigValues: Number of Huffman-coded value pairs.
+  ///   - sampleRate: Sample rate used to look up scalefactor band widths.
+  /// - Returns: A tuple of (region0_count, region1_count) clamped to valid ranges.
   private func calculateRegionCounts(bigValues: Int, sampleRate: Int) -> (Int, Int) {
-    // bigValues * 2 = number of spectral samples in regions 0, 1, 2
     let bigValuesRegion = bigValues * 2
-
-    // Get scalefactor band boundaries for this sample rate
     let bands = ScaleFactorBands.bandTable(for: sampleRate)
 
-    // Calculate cumulative boundaries
     var boundaries = [Int]()
     var cumulative = 0
     for width in bands {
@@ -649,8 +675,6 @@ public final class MP3Encoder {
       boundaries.append(cumulative)
     }
 
-    // Find region0_count: highest band index where boundary <= bigValuesRegion
-    // region0 ends at scalefactor band (region0_count + 1)
     var region0Count = 0
     for i in 0..<min(15, boundaries.count) {
       if boundaries[i] <= bigValuesRegion {
@@ -660,8 +684,6 @@ public final class MP3Encoder {
       }
     }
 
-    // Find region1_count: additional bands after region0
-    // region1 ends at scalefactor band (region0_count + region1_count + 2)
     var region1Count = 0
     let region1Start = region0Count + 1
     for i in region1Start..<min(region1Start + 7, boundaries.count) {
@@ -672,11 +694,15 @@ public final class MP3Encoder {
       }
     }
 
-    // Clamp to valid ranges (region0_count: 0-15, region1_count: 0-7)
     return (min(region0Count, 15), min(region1Count, 7))
   }
   
-  /// Deinterleaves stereo samples using vDSP stride operations.
+  /// Separates interleaved multi-channel samples into per-channel arrays using vDSP.
+  ///
+  /// - Parameters:
+  ///   - samples: Interleaved PCM samples (e.g. L, R, L, R, ...).
+  ///   - channels: Number of channels. Returns the input unchanged for mono.
+  /// - Returns: An array of per-channel sample arrays.
   private func deinterleave(samples: [Float], channels: Int) -> [[Float]] {
     guard channels > 1 else {
       return [samples]
@@ -685,11 +711,9 @@ public final class MP3Encoder {
     let samplesPerChannel = samples.count / channels
     var result = [[Float]](repeating: [Float](repeating: 0, count: samplesPerChannel), count: channels)
 
-    // Use vDSP to extract each channel with stride
     samples.withUnsafeBufferPointer { srcPtr in
       for ch in 0..<channels {
         result[ch].withUnsafeMutableBufferPointer { dstPtr in
-          // Copy every nth sample starting at offset ch
           vDSP_mmov(
             srcPtr.baseAddress! + ch,
             dstPtr.baseAddress!,
@@ -705,16 +729,18 @@ public final class MP3Encoder {
     return result
   }
   
-  /// Processes PCM samples through the polyphase filterbank to generate subband samples.
+  /// Processes PCM samples through the polyphase analysis filterbank.
+  ///
+  /// Feeds 32 samples at a time into the filterbank, producing 18 iterations
+  /// that yield 18 subband samples per subband (576 / 32 = 18).
+  ///
   /// - Parameters:
-  ///   - samples: 576 PCM samples for one granule
-  ///   - channel: Channel index for accessing filterbank buffer
-  /// - Returns: 32 subbands, each with 18 samples
+  ///   - samples: 576 PCM samples for one granule.
+  ///   - channel: Channel index for accessing the persistent filterbank buffer.
+  /// - Returns: 32 subbands, each containing 18 time-domain samples.
   private func analyzeSubbands(_ samples: [Float], channel: Int) -> [[Float]] {
     var subbands = Array(repeating: [Float](), count: Self.subbands)
 
-    // Process 32 samples at a time through the filterbank
-    // 576 samples / 32 = 18 filterbank iterations = 18 subband samples per subband
     var offset = 0
     for _ in 0..<18 {
       let chunk: [Float]
@@ -741,41 +767,38 @@ public final class MP3Encoder {
     return subbands
   }
 
+  /// Encodes one granule through the full spectral processing pipeline.
+  ///
+  /// Applies the polyphase filterbank, transient detection, MDCT, and psychoacoustic
+  /// analysis to produce frequency-domain coefficients ready for quantization.
+  ///
+  /// - Parameters:
+  ///   - samples: 576 PCM samples for one granule.
+  ///   - channel: Channel index for persistent filterbank and MDCT state.
+  ///   - sampleRate: Sample rate in Hz.
+  /// - Returns: Spectral analysis results including MDCT coefficients, gain, and block type.
   private func encodeSpectrum(
     _ samples: [Float],
     channel: Int,
     sampleRate: Int
   ) -> SpectrumResult {
-    // Step 1: Analyze PCM through polyphase filterbank → 32 subbands × 18 samples
     let subbands = self.analyzeSubbands(samples, channel: channel)
-
-    // Filterbank debug disabled - verified working correctly
-    // Energy distribution: ~92-94% in low subbands (0-7), ~5-7% in mid, ~0% in high
-
-    // Step 2: Detect transients for block type decision
     let transient = TransientDetector.analyze(samples: samples)
 
-    // Step 3: Apply MDCT to subband samples → 576 frequency coefficients
     let mdct = MDCT.apply(
       subbandSamples: subbands,
       overlap: &self.mdctOverlap[channel],
       blockType: transient.blockType
     )
 
-    // MDCT debug disabled - verified working correctly
-    // Energy distribution: ~93-94% in low subbands, ~0% in high subbands
-
-    // Step 4: Psychoacoustic masking thresholds (for noise allocation, not used yet)
     let thresholds = PsychoacousticModel.maskingThresholds(
       spectrum: mdct,
       sampleRate: sampleRate,
       quality: self.options.quality
     )
 
-    // Don't normalize the spectrum - pass MDCT output directly to quantization.
-    // Scalefactors in MP3 are for the decoder to scale reconstructed values,
-    // but since we're using scalefac_compress=0, we encode no scalefactors.
-    // The global_gain alone controls the quantization step size.
+    // Scalefactors are unity since scalefac_compress=0 (no scalefactors encoded).
+    // Global gain alone controls the quantization step size.
     let scalefactors = [Float](repeating: 1.0, count: mdct.count)
 
     let gain = self.computeGlobalGain(mdct)
@@ -795,21 +818,20 @@ public final class MP3Encoder {
     )
   }
   
-  /// Computes global gain from MDCT spectral coefficients.
-  /// According to ISO 11172-3: global_gain controls the quantizer step size.
-  /// Formula: quantizer_step = 2^((global_gain - 210) / 4)
+  /// Computes an initial global gain from the peak spectral magnitude.
+  ///
+  /// Solves for the gain that maps the peak value to the maximum of Huffman table 15 (value 15),
+  /// using the ISO 11172-3 quantization formula: `gain = 210 + 4 * log2(|peak|^0.75 / 15)`.
+  ///
+  /// - Parameter spectral: MDCT spectral coefficients.
+  /// - Returns: Global gain value in the range 0-255, or 210 for silence.
   private func computeGlobalGain(_ spectral: [Float]) -> Int {
-    // Find the peak magnitude in the spectrum
     let peak = spectral.map { abs($0) }.max() ?? 0
 
     guard peak > 0 else {
-      return 210  // Default gain for silence
+      return 210
     }
 
-    // We want to find gain such that the largest quantized value fits in table range.
-    // Since we're using table 15 (max value 15), target max = 15
-    // quantized = |x|^0.75 / 2^((gain - 210) / 4)
-    // Solve for gain: gain = 210 + 4 * log2(|x|^0.75 / target)
     let targetMax: Float = 15.0
     let peakPow = pow(peak, 0.75)
     let ratio = peakPow / targetMax
@@ -822,31 +844,35 @@ public final class MP3Encoder {
     return min(max(gain, 0), 255)
   }
 
-  /// Quantizes spectral coefficients according to ISO 11172-3.
-  /// Formula: ix = nint(|xr|^0.75 / 2^((global_gain - 210) / 4))
+  /// Quantizes spectral coefficients using ISO 11172-3 power-law quantization.
+  ///
+  /// Applies `ix = nint(|xr|^0.75 / 2^((global_gain - 210) / 4))` and clamps
+  /// to the Huffman table 15 range of 0-15.
+  ///
+  /// - Parameters:
+  ///   - spectral: MDCT spectral coefficients.
+  ///   - scalefactors: Per-coefficient scale factors.
+  ///   - thresholds: Psychoacoustic masking thresholds.
+  ///   - globalGain: Quantizer step size control (0-255).
+  /// - Returns: Signed quantized values.
   private func quantizeSpectral(
     _ spectral: [Float],
     scalefactors: [Float],
     thresholds: [Float],
     globalGain: Int
   ) -> [Int] {
-    // Quantizer step: 2^((global_gain - 210) / 4)
     let stepPower = Double(globalGain - 210) / 4.0
     let quantizerStep = max(pow(2.0, stepPower), 0.0001)
 
     return spectral.enumerated().map { _, value in
-      // MP3 power-law quantization: ix = nint(|xr|^0.75 / step)
       let absValue = abs(value)
 
-      // Skip very small values to avoid numerical issues
       guard absValue > 1e-10 else {
         return 0
       }
 
       let magnitude = pow(Double(absValue), 0.75)
       let quantized = Int((magnitude / quantizerStep).rounded())
-
-      // Global gain is calculated to target max 15, but clamp just in case
       let clamped = min(quantized, 15)
 
       return value < 0 ? -clamped : clamped
@@ -854,10 +880,12 @@ public final class MP3Encoder {
   }
 }
 
+/// Tracks recent frame statistics for variable bitrate encoding decisions.
 private struct VBRState {
   private var gainHistory: [Int] = []
   private var energyHistory: [Float] = []
-  
+
+  /// Records the gain and energy of the most recent granule.
   mutating func update(globalGain: Int, energy: Float) {
     gainHistory.append(globalGain)
     if gainHistory.count > 10 {
@@ -869,45 +897,51 @@ private struct VBRState {
     }
   }
   
+  /// Suggests a global gain based on recent history and quality setting.
   func globalGain(quality: Int) -> Int {
     let average = gainHistory.isEmpty ? 180 : gainHistory.reduce(0, +) / gainHistory.count
     return min(max(average + (9 - quality) * 2, 0), 255)
   }
   
+  /// Estimates the part2_3_length for a given quality level.
   func estimatePart23Length(quality: Int) -> Int {
     let base = 450
     return max(0, base - quality * 30)
   }
   
-  /// Chooses bitrate for VBR encoding based on frame energy and quality setting.
-  /// Quality 0 = highest quality (use more bits), quality 9 = lowest (use fewer bits).
+  /// Chooses a bitrate for VBR encoding based on frame energy and quality setting.
+  ///
+  /// Compares the current frame's energy to the running average and adjusts the
+  /// bitrate proportionally. Higher quality settings allow wider bitrate swings.
+  ///
+  /// - Parameters:
+  ///   - base: Base bitrate in kbps.
+  ///   - energy: Energy of the current frame.
+  ///   - quality: Quality level (0 = highest quality, 9 = lowest).
+  /// - Returns: Selected bitrate in kbps, clamped to valid bounds.
   func chooseBitrate(base: Int, energy: Float, quality: Int) -> Int {
     let average = energyHistory.isEmpty ? energy : energyHistory.reduce(0, +) / Float(energyHistory.count)
     let ratio = min(max(energy / max(average, 0.0001), 0.5), 2.0)
 
-    // Quality affects how much we can deviate from base and the floor/ceiling
-    // Quality 0: wide range (64-320), aggressive adjustments
-    // Quality 9: narrow range, conservative adjustments
-    let qualityFactor = Float(9 - quality) / 9.0  // 1.0 for quality 0, 0.0 for quality 9
-    let maxAdjustment = Int(32.0 + 32.0 * qualityFactor)  // 32-64 kbps swing
+    let qualityFactor = Float(9 - quality) / 9.0
+    let maxAdjustment = Int(32.0 + 32.0 * qualityFactor)
     let adjustment = Int((ratio - 1.0) * Float(maxAdjustment))
 
-    // Quality also affects the minimum bitrate floor
-    let minBitrate = max(32, base - 64 + quality * 8)  // Higher quality = lower allowed minimum
-    let maxBitrate = min(320, base + 64 - quality * 4)  // Higher quality = higher allowed maximum
+    let minBitrate = max(32, base - 64 + quality * 8)
+    let maxBitrate = min(320, base + 64 - quality * 4)
 
     return max(minBitrate, min(base + adjustment, maxBitrate))
   }
 }
 
 // MARK: - Polyphase Analysis Filterbank
-// MP3 encoding requires splitting PCM into 32 frequency subbands before MDCT
 
+/// ISO 11172-3 polyphase analysis filterbank for splitting PCM into 32 frequency subbands.
 private enum PolyphaseFilterbank {
-  // Pre-computed analysis matrix: M[k][n] = cos((2k+1)(n-16)*PI/64) for k=0..31, n=0..63
-  // Computed once at initialization to avoid repeated cos() calls
+  /// Lazily-computed analysis matrix: `M[k][n] = cos((2k+1)(n-16) * PI/64)`.
   nonisolated(unsafe) private static var analysisMatrix: [[Float]]?
 
+  /// Returns the 32x64 analysis cosine matrix, computing it on first access.
   private static func getAnalysisMatrix() -> [[Float]] {
     if let matrix = analysisMatrix { return matrix }
     var matrix = [[Float]](repeating: [Float](repeating: 0, count: 64), count: 32)
@@ -921,9 +955,7 @@ private enum PolyphaseFilterbank {
     return matrix
   }
 
-  // ISO 11172-3 Table C.1 - Analysis window coefficients (512 values)
-  // These are the exact coefficients from the MPEG Audio standard.
-  // Source: ISO/IEC 11172-3:1993 Table 3-C.1
+  /// ISO 11172-3 Table C.1 analysis window coefficients (512 values).
   private static let isoAnalysisWindow: [Float] = [
     // Row 0
     0.000000000, -0.000000477, -0.000000477, -0.000000477,
@@ -1071,64 +1103,56 @@ private enum PolyphaseFilterbank {
     0.000000477, 0.000000477, 0.000000477, 0.000000477
   ]
 
-  /// Gets the 512-tap analysis window coefficients.
-  /// Based on ISO 11172-3 Table C.1 - analysis window coefficients.
+  /// Returns the 512-tap analysis window coefficients.
   private static func getAnalysisWindow() -> [Float] {
     return isoAnalysisWindow
   }
 
-  /// Analysis filterbank: converts 32 new PCM samples to 32 subband samples.
-  /// Implements the ISO 11172-3 analysis filterbank algorithm.
-  /// Uses Accelerate framework for vectorized operations.
+  /// Converts 32 new PCM samples into 32 subband samples.
+  ///
+  /// Implements the three-step ISO 11172-3 analysis filterbank: windowing the
+  /// 512-sample buffer, partial summation at stride 64, and matrixing with
+  /// the cosine analysis matrix. Uses vDSP for all vectorized operations.
+  ///
   /// - Parameters:
-  ///   - newSamples: 32 new PCM samples
-  ///   - buffer: 512-sample FIFO buffer (updated in place)
-  /// - Returns: 32 subband samples
+  ///   - newSamples: 32 new PCM samples to push into the filterbank.
+  ///   - buffer: 512-sample sliding buffer, updated in place.
+  /// - Returns: 32 subband samples.
   static func analyze(newSamples: [Float], buffer: inout [Float]) -> [Float] {
-    // Ensure buffer is 512 samples
     if buffer.count < 512 {
       buffer = [Float](repeating: 0, count: 512 - buffer.count) + buffer
     }
 
-    // Shift buffer left by 32 and add new samples at end using memmove
-    // This is more efficient than removeFirst which is O(n)
     _ = buffer.withUnsafeMutableBufferPointer { ptr in
-      // Move 480 samples from offset 32 to offset 0
       memmove(ptr.baseAddress!, ptr.baseAddress! + 32, 480 * MemoryLayout<Float>.size)
     }
-    // Copy new samples to the end
     let copyCount = min(32, newSamples.count)
     for i in 0..<copyCount {
       buffer[480 + i] = newSamples[i]
     }
-    // Zero-fill if newSamples is short
     for i in copyCount..<32 {
       buffer[480 + i] = 0
     }
 
     let window = getAnalysisWindow()
 
-    // Step 1: Window the 512-sample buffer using vDSP
-    // Reverse the buffer first for proper alignment with window using vDSP
+    // Step 1: Reverse and window the 512-sample buffer
     var reversed = buffer
     vDSP_vrvrs(&reversed, 1, 512)
     var windowed = [Float](repeating: 0, count: 512)
     vDSP_vmul(reversed, 1, window, 1, &windowed, 1, 512)
 
-    // Step 2: Partial calculation - sum every 64th sample
-    // Y[j] = sum(Z[i*64 + j]) for i=0..7
-    // Use pointer arithmetic to avoid creating intermediate arrays
+    // Step 2: Partial sum — Y[j] = sum(Z[i*64 + j]) for i=0..7
     var partial = [Float](repeating: 0, count: 64)
     windowed.withUnsafeBufferPointer { ptr in
       for j in 0..<64 {
         var sum: Float = 0
-        // Sum 8 values at stride 64 using vDSP
         vDSP_sve(ptr.baseAddress! + j, 64, &sum, 8)
         partial[j] = sum
       }
     }
 
-    // Step 3: Matrix multiply using pre-computed analysis matrix and vDSP
+    // Step 3: Matrix multiply with cosine analysis matrix
     let matrix = getAnalysisMatrix()
     var subbands = [Float](repeating: 0, count: 32)
     for k in 0..<32 {
@@ -1141,21 +1165,22 @@ private enum PolyphaseFilterbank {
   }
 }
 
-// MARK: - MDCT for MP3 Layer III
+// MARK: - MDCT
 
+/// Modified Discrete Cosine Transform for MPEG-1 Layer III.
+///
+/// Transforms subband samples from the polyphase filterbank into
+/// frequency-domain coefficients with overlap-add windowing.
 private enum MDCT {
-  // Windows for MDCT - sized correctly per MP3 spec
   nonisolated(unsafe) private static var longWindow: [Float]?
   nonisolated(unsafe) private static var shortWindow: [Float]?
   nonisolated(unsafe) private static var startWindow: [Float]?
   nonisolated(unsafe) private static var stopWindow: [Float]?
 
-  // Pre-computed MDCT cosine tables
-  // Long block: cos(PI/(2*36) * (2k + 1 + 18) * (2m + 1)) for k=0..35, m=0..17
   nonisolated(unsafe) private static var longMDCTMatrix: [[Float]]?
-  // Short block: cos(PI/(2*12) * (2k + 1 + 6) * (2m + 1)) for k=0..11, m=0..5
   nonisolated(unsafe) private static var shortMDCTMatrix: [[Float]]?
 
+  /// Returns the 18x36 long-block MDCT cosine matrix, computing it on first access.
   private static func getLongMDCTMatrix() -> [[Float]] {
     if let matrix = longMDCTMatrix { return matrix }
     let n = 36
@@ -1171,6 +1196,7 @@ private enum MDCT {
     return matrix
   }
 
+  /// Returns the 6x12 short-block MDCT cosine matrix, computing it on first access.
   private static func getShortMDCTMatrix() -> [[Float]] {
     if let matrix = shortMDCTMatrix { return matrix }
     let n = 12
@@ -1186,7 +1212,7 @@ private enum MDCT {
     return matrix
   }
 
-  /// Long block window: 36 samples (used for MDCT input of 36 → 18 output)
+  /// Returns the 36-sample sine window for long blocks.
   private static func getLongWindow() -> [Float] {
     if let window = longWindow { return window }
     let n = 36
@@ -1198,7 +1224,7 @@ private enum MDCT {
     return window
   }
 
-  /// Short block window: 12 samples (used for MDCT input of 12 → 6 output)
+  /// Returns the 12-sample sine window for short blocks.
   private static func getShortWindow() -> [Float] {
     if let window = shortWindow { return window }
     let n = 12
@@ -1210,19 +1236,16 @@ private enum MDCT {
     return window
   }
 
-  /// Start block window for long-to-short transition
+  /// Returns the 36-sample start window for long-to-short block transitions.
   private static func getStartWindow() -> [Float] {
     if let window = startWindow { return window }
     var window = [Float](repeating: 0, count: 36)
-    // First half: long window
     for i in 0..<18 {
       window[i] = Float(sin(Double.pi / 36.0 * (Double(i) + 0.5)))
     }
-    // Transition region
     for i in 18..<24 {
       window[i] = 1.0
     }
-    // Short window tail
     for i in 24..<30 {
       window[i] = Float(sin(Double.pi / 12.0 * (Double(i - 18) + 0.5)))
     }
@@ -1233,22 +1256,19 @@ private enum MDCT {
     return window
   }
 
-  /// Stop block window for short-to-long transition
+  /// Returns the 36-sample stop window for short-to-long block transitions.
   private static func getStopWindow() -> [Float] {
     if let window = stopWindow { return window }
     var window = [Float](repeating: 0, count: 36)
     for i in 0..<6 {
       window[i] = 0.0
     }
-    // Short window rise
     for i in 6..<12 {
       window[i] = Float(sin(Double.pi / 12.0 * (Double(i - 6) + 0.5)))
     }
-    // Transition region
     for i in 12..<18 {
       window[i] = 1.0
     }
-    // Long window tail
     for i in 18..<36 {
       window[i] = Float(sin(Double.pi / 36.0 * (Double(i) + 0.5)))
     }
@@ -1256,14 +1276,13 @@ private enum MDCT {
     return window
   }
 
-  /// Applies MDCT to subband samples for one granule.
-  /// For long blocks: 18 subband samples → 18 MDCT coefficients per subband
-  /// For short blocks: 18 subband samples → 3 windows × 6 coefficients per subband
+  /// Applies MDCT to all 32 subbands for one granule with overlap-add.
+  ///
   /// - Parameters:
-  ///   - subbandSamples: Array of 32 subbands, each with 18 samples
-  ///   - overlap: Previous 18 samples per subband for overlap-add
-  ///   - blockType: Block type for windowing
-  /// - Returns: 576 frequency-domain coefficients
+  ///   - subbandSamples: 32 subbands, each with 18 time-domain samples.
+  ///   - overlap: Previous 18 samples per subband, updated in place for the next granule.
+  ///   - blockType: Window shape selection (long, short, or mixed).
+  /// - Returns: 576 frequency-domain MDCT coefficients.
   static func apply(subbandSamples: [[Float]], overlap: inout [[Float]], blockType: BlockType) -> [Float] {
     var output = [Float](repeating: 0, count: 576)
 
@@ -1271,15 +1290,13 @@ private enum MDCT {
       var currentSamples = sb < subbandSamples.count ? subbandSamples[sb] : [Float](repeating: 0, count: 18)
       let previousSamples = sb < overlap.count ? overlap[sb] : [Float](repeating: 0, count: 18)
 
-      // Compensate for inversion in the analysis filter.
-      // For odd-numbered subbands, only odd-indexed samples are inverted.
+      // Compensate for frequency inversion in odd-numbered subbands
       if (sb & 1) != 0 {
         for k in stride(from: 1, to: min(currentSamples.count, 18), by: 2) {
           currentSamples[k] *= -1
         }
       }
 
-      // Combine previous and current for 36-sample window
       var combined = [Float](repeating: 0, count: 36)
       for i in 0..<18 {
         combined[i] = i < previousSamples.count ? previousSamples[i] : 0
@@ -1288,7 +1305,6 @@ private enum MDCT {
         combined[18 + i] = i < currentSamples.count ? currentSamples[i] : 0
       }
 
-      // Update overlap buffer
       if sb < overlap.count {
         overlap[sb] = Array(currentSamples.prefix(18))
         while overlap[sb].count < 18 {
@@ -1296,7 +1312,6 @@ private enum MDCT {
         }
       }
 
-      // Apply MDCT based on block type
       let mdctCoeffs: [Float]
       switch blockType {
       case .long:
@@ -1305,22 +1320,17 @@ private enum MDCT {
         mdctCoeffs = mdctShort(samples: combined)
       case .mixed:
         if sb < 2 {
-          // Low frequency subbands use long blocks
           mdctCoeffs = mdctLong(samples: combined, window: getLongWindow())
         } else {
           mdctCoeffs = mdctShort(samples: combined)
         }
       }
 
-      // Output in subband-major order (MP3 standard frequency ordering)
-      // Each subband's 18 MDCT coefficients are stored consecutively
       for i in 0..<18 {
         output[sb * 18 + i] = i < mdctCoeffs.count ? mdctCoeffs[i] : 0
       }
     }
 
-    // Apply aliasing reduction butterfly (ISO 11172-3 Table B.9)
-    // This cancels aliasing between adjacent subbands
     if blockType == .long {
       applyAliasingReduction(&output)
     }
@@ -1328,9 +1338,7 @@ private enum MDCT {
     return output
   }
 
-  /// Aliasing reduction coefficients from ISO 11172-3 Table B.9
-  /// cs[i]^2 + ca[i]^2 = 1 for all i
-  /// Using SIMD8 for vectorized butterfly operations.
+  /// Aliasing reduction coefficients from ISO 11172-3 Table B.9 (cs[i]^2 + ca[i]^2 = 1).
   private static let aliasingCS = SIMD8<Float>(
     0.857492926, 0.881741997, 0.949628649, 0.983314592,
     0.995517816, 0.999160558, 0.999899195, 0.999993155
@@ -1340,15 +1348,15 @@ private enum MDCT {
     -0.094574193, -0.040965583, -0.014198569, -0.003699975
   )
 
-  /// Applies aliasing reduction butterfly between adjacent subbands using SIMD.
-  /// For long blocks only (short blocks don't need this).
+  /// Applies the ISO 11172-3 aliasing reduction butterfly between adjacent subbands using SIMD.
+  ///
+  /// Only applied to long blocks. Performs 8-wide butterfly operations across
+  /// the 31 subband boundaries to cancel aliasing from the polyphase filterbank.
   private static func applyAliasingReduction(_ spectrum: inout [Float]) {
-    // Apply butterfly between each pair of adjacent subbands (31 boundaries)
     for sb in 0..<31 {
       let sbEnd = sb * 18 + 17
       let sbNextStart = (sb + 1) * 18
 
-      // Gather 8 upper values (reversed order) and 8 lower values
       let upper = SIMD8<Float>(
         spectrum[sbEnd], spectrum[sbEnd - 1], spectrum[sbEnd - 2], spectrum[sbEnd - 3],
         spectrum[sbEnd - 4], spectrum[sbEnd - 5], spectrum[sbEnd - 6], spectrum[sbEnd - 7]
@@ -1358,11 +1366,9 @@ private enum MDCT {
         spectrum[sbNextStart + 4], spectrum[sbNextStart + 5], spectrum[sbNextStart + 6], spectrum[sbNextStart + 7]
       )
 
-      // Vectorized butterfly: bu = lower * ca + upper * cs, bd = lower * cs - upper * ca
       let newUpper = lower * aliasingCA + upper * aliasingCS
       let newLower = lower * aliasingCS - upper * aliasingCA
 
-      // Scatter results back
       spectrum[sbEnd] = newUpper[0]
       spectrum[sbEnd - 1] = newUpper[1]
       spectrum[sbEnd - 2] = newUpper[2]
@@ -1383,18 +1389,15 @@ private enum MDCT {
     }
   }
 
-  /// MDCT for long blocks: 36 input → 18 output
-  /// Uses ISO 11172-3 formula with pre-computed cosine matrix and vDSP.
+  /// Computes the MDCT for a long block (36 input samples to 18 coefficients).
   private static func mdctLong(samples: [Float], window: [Float]) -> [Float] {
     let n = 36
     let halfN = 18
-    let normalization: Float = 9.0  // N/4 for long blocks
+    let normalization: Float = 9.0
 
-    // Apply window using vDSP
     var windowed = [Float](repeating: 0, count: n)
     vDSP_vmul(samples, 1, window, 1, &windowed, 1, vDSP_Length(n))
 
-    // MDCT using pre-computed matrix and vDSP dot products
     let matrix = getLongMDCTMatrix()
     var output = [Float](repeating: 0, count: halfN)
     for m in 0..<halfN {
@@ -1406,19 +1409,16 @@ private enum MDCT {
     return output
   }
 
-  /// MDCT for short blocks: 3 windows of 12 samples each → 18 total coefficients
-  /// Uses ISO 11172-3 formula with pre-computed cosine matrix and vDSP.
+  /// Computes the MDCT for a short block (3 windows of 12 samples each, 18 total coefficients).
   private static func mdctShort(samples: [Float]) -> [Float] {
     let shortWindow = getShortWindow()
     var output = [Float](repeating: 0, count: 18)
     let n = 12
-    let normalization: Float = 3.0  // N/4 for short blocks
+    let normalization: Float = 3.0
 
     let matrix = getShortMDCTMatrix()
 
-    // Three short windows
     for w in 0..<3 {
-      // Extract 12 samples for this window and apply window
       let offset = w * 6 + 6
       var windowSamples = [Float](repeating: 0, count: n)
       for i in 0..<n {
@@ -1426,7 +1426,6 @@ private enum MDCT {
         windowSamples[i] = idx < samples.count ? samples[idx] * shortWindow[i] : 0
       }
 
-      // MDCT using pre-computed matrix and vDSP
       for m in 0..<6 {
         var result: Float = 0
         vDSP_dotpr(windowSamples, 1, matrix[m], 1, &result, vDSP_Length(n))
@@ -1438,9 +1437,11 @@ private enum MDCT {
   }
 }
 
+/// Huffman encoder for MPEG-1 Layer III spectral data.
+///
+/// Encodes quantized spectral value pairs using the ISO 11172-3 Huffman code tables.
 private struct HuffmanEncoder {
-  /// Encodes values using table 1 (correct ISO codes) and returns the number of bits written.
-  /// Table 1 handles values 0-1 only but has verified correct Huffman codes.
+  /// Encodes value pairs using Huffman table 1 (values 0-1).
   func encodeWithTable1(_ values: [Int], writer: inout BitstreamWriter) -> Int {
     let startBits = writer.bitCount
     var index = 0
@@ -1459,8 +1460,7 @@ private struct HuffmanEncoder {
     return writer.bitCount - startBits
   }
 
-  /// Writes a pair of values using table 1 (ISO 11172-3 Table B.7).
-  /// Table 1 codes: (0,0)=1, (0,1)=001, (1,0)=011, (1,1)=010
+  /// Writes a value pair using Huffman table 1.
   private func writePairTable1(x: Int, y: Int, writer: inout BitstreamWriter) {
     let absX = min(abs(x), 1)
     let absY = min(abs(y), 1)
@@ -1468,7 +1468,6 @@ private struct HuffmanEncoder {
     let code = MP3Tables.table1.table[absX][absY]
     writer.write(bits: code.bits, count: code.length)
 
-    // Sign bits follow the Huffman code (only if value is non-zero)
     if absX != 0 {
       writer.write(bits: x < 0 ? 1 : 0, count: 1)
     }
@@ -1477,7 +1476,7 @@ private struct HuffmanEncoder {
     }
   }
 
-  /// Encodes values using table 15 (forced) and returns the number of bits written.
+  /// Encodes value pairs using Huffman table 15 (values 0-15, no linbits).
   func encodeWithTable15(_ values: [Int], writer: inout BitstreamWriter) -> Int {
     let startBits = writer.bitCount
     var index = 0
@@ -1496,17 +1495,14 @@ private struct HuffmanEncoder {
     return writer.bitCount - startBits
   }
 
-  /// Writes a pair of values using table 15 specifically.
-  /// Table 15 is a 16x16 table for values 0-15 with NO linbits (linbits=0).
+  /// Writes a value pair using Huffman table 15.
   private func writePairTable15(x: Int, y: Int, writer: inout BitstreamWriter) {
     let absX = min(abs(x), 15)
     let absY = min(abs(y), 15)
 
-    // Write the Huffman code
     let code = MP3Tables.table15.table[absX][absY]
     writer.write(bits: code.bits, count: code.length)
 
-    // Sign bits follow (only if value is non-zero)
     if absX != 0 {
       writer.write(bits: x < 0 ? 1 : 0, count: 1)
     }
@@ -1515,7 +1511,7 @@ private struct HuffmanEncoder {
     }
   }
 
-  /// Encodes values and returns the number of bits written (dynamic table selection).
+  /// Encodes value pairs with automatic Huffman table selection.
   func encode(_ values: [Int], writer: inout BitstreamWriter) -> Int {
     let startBits = writer.bitCount
     var index = 0
@@ -1534,16 +1530,13 @@ private struct HuffmanEncoder {
     return writer.bitCount - startBits
   }
 
+  /// Writes a value pair using the smallest suitable Huffman table.
   private func writePair(x: Int, y: Int, writer: inout BitstreamWriter) {
     let absX = min(abs(x), MP3Tables.table15.maxValue)
     let absY = min(abs(y), MP3Tables.table15.maxValue)
-
-    // Select appropriate table based on maximum value
     let table = self.selectTable(absX: absX, absY: absY)
 
-    // Bounds check before table lookup
     guard absX < table.table.count && absY < table.table[absX].count else {
-      // Fallback: use table15 which handles all values 0-15
       let code = MP3Tables.table15.table[min(absX, 15)][min(absY, 15)]
       writer.write(bits: code.bits, count: code.length)
       if absX != 0 {
@@ -1558,7 +1551,6 @@ private struct HuffmanEncoder {
     let code = table.table[absX][absY]
     writer.write(bits: code.bits, count: code.length)
 
-    // Sign bits follow the Huffman code
     if absX != 0 {
       writer.write(bits: x < 0 ? 1 : 0, count: 1)
     }
@@ -1567,11 +1559,9 @@ private struct HuffmanEncoder {
     }
   }
 
+  /// Selects the smallest Huffman table that can encode both values.
   private func selectTable(absX: Int, absY: Int) -> MP3Tables.HuffmanTable {
     let maxValue = max(absX, absY)
-
-    // Select smallest table that can encode these values
-    // Tables: 1 (0-1), 2/3 (0-2), 5/6 (0-3), 7/8/9 (0-5), 10 (0-7), 13/15 (0-15)
     if maxValue <= MP3Tables.table1.maxValue {
       return MP3Tables.table1
     }
@@ -1591,22 +1581,28 @@ private struct HuffmanEncoder {
   }
 }
 
+/// Scale factor band definitions from ISO 11172-3 Table B.8.
+///
+/// These define frequency groupings that approximate human auditory critical bands.
 private enum ScaleFactorBands {
-  /// Scale factor band widths from ISO 11172-3 Table B.8
-  /// These define the frequency groupings that approximate human critical bands.
-
-  /// Long block scalefactor band widths for 44100 Hz (21 bands)
+  /// Long block band widths for 44100 Hz (21 bands).
   static let longBands44100 = [4, 4, 4, 4, 4, 4, 6, 6, 8, 8, 10, 12, 16, 20, 24, 28, 34, 42, 50, 54, 76]
 
-  /// Long block scalefactor band widths for 48000 Hz (21 bands)
+  /// Long block band widths for 48000 Hz (21 bands).
   static let longBands48000 = [4, 4, 4, 4, 4, 4, 6, 6, 6, 8, 10, 12, 16, 18, 22, 28, 34, 40, 46, 54, 54]
 
-  /// Long block scalefactor band widths for 32000 Hz (21 bands)
+  /// Long block band widths for 32000 Hz (21 bands).
   static let longBands32000 = [4, 4, 4, 4, 4, 4, 6, 6, 8, 10, 12, 16, 20, 24, 30, 38, 46, 56, 68, 84, 102]
 
-  /// Short block scalefactor band widths for 44100 Hz (12 bands, applied 3 times)
+  /// Short block band widths for 44100 Hz (12 bands, applied 3 times).
   static let shortBands44100 = [4, 4, 4, 4, 6, 8, 10, 12, 14, 18, 22, 30]
 
+  /// Normalizes spectral coefficients per band and returns per-coefficient scale factors.
+  ///
+  /// - Parameters:
+  ///   - spectrum: Raw spectral coefficients.
+  ///   - sampleRate: Sample rate for band table lookup.
+  /// - Returns: A tuple of (normalized spectrum, per-coefficient scale factors).
   static func scale(spectrum: [Float], sampleRate: Int) -> ([Float], [Float]) {
     let bands = bandTable(for: sampleRate)
     var scalefactors = [Float]()
@@ -1623,13 +1619,9 @@ private enum ScaleFactorBands {
 
       let slice = spectrum[start..<end]
       let peak = slice.map { abs($0) }.max() ?? 0.0
-
-      // Scale factor represents the maximum in this band
-      // Used for both normalization and to compute scalefac_compress
       let scale = max(peak, 0.0001)
       scalefactors.append(scale)
 
-      // Normalize spectrum within this band
       for index in start..<end {
         scaledSpectrum[index] = spectrum[index] / scale
       }
@@ -1637,7 +1629,6 @@ private enum ScaleFactorBands {
       cursor = end
     }
 
-    // Expand scalefactors to per-coefficient for compatibility
     var expandedScalefactors = [Float](repeating: 0.0001, count: spectrum.count)
     cursor = 0
     for (idx, bandWidth) in bands.enumerated() {
@@ -1659,6 +1650,7 @@ private enum ScaleFactorBands {
     return (scaledSpectrum, expandedScalefactors)
   }
 
+  /// Returns the long-block band width table for the given sample rate.
   static func bandTable(for sampleRate: Int) -> [Int] {
     switch sampleRate {
     case 48_000:
@@ -1670,7 +1662,7 @@ private enum ScaleFactorBands {
     }
   }
 
-  /// Returns the number of scalefactor bands for a given sample rate and block type.
+  /// Returns the number of scale factor bands for a given sample rate and block type.
   static func bandCount(for sampleRate: Int, isShort: Bool) -> Int {
     if isShort {
       return 12
@@ -1679,8 +1671,9 @@ private enum ScaleFactorBands {
   }
 }
 
+/// Utility for frame-level signal analysis.
 private enum FrameAnalysis {
-  /// Calculates the average energy (mean square) of samples using vDSP.
+  /// Calculates the mean square energy of samples using vDSP.
   static func energy(samples: [Float]) -> Float {
     guard !samples.isEmpty else { return 0 }
     var sumOfSquares: Float = 0
@@ -1689,6 +1682,7 @@ private enum FrameAnalysis {
   }
 }
 
+/// Result of spectral encoding for one granule.
 private struct SpectrumResult {
   let spectral: [Float]
   let scalefactors: [Float]
@@ -1700,18 +1694,28 @@ private struct SpectrumResult {
   let maskingThresholds: [Float]
 }
 
+/// MDCT block type selection.
 private enum BlockType: Int {
   case long = 0
   case short = 2
   case mixed = 1
 }
 
+/// Result of transient detection for block type selection.
 private struct TransientResult {
   let blockType: BlockType
   let subblockGain: [Int]
 }
 
+/// Detects transients to decide between long and short MDCT block types.
 private enum TransientDetector {
+  /// Analyzes energy distribution across sub-blocks to detect transients.
+  ///
+  /// If the energy ratio between sub-blocks exceeds a threshold, a short or
+  /// mixed block type is selected to improve temporal resolution.
+  ///
+  /// - Parameter samples: PCM samples for one granule.
+  /// - Returns: Block type and per-subblock gain values.
   static func analyze(samples: [Float]) -> TransientResult {
     let subblockCount = 3
     let subblockSize = max(samples.count / subblockCount, 1)
@@ -1739,8 +1743,18 @@ private enum TransientDetector {
   }
 }
 
+/// Simplified psychoacoustic model for computing masking thresholds.
 private enum PsychoacousticModel {
-  /// Calculates masking thresholds using vDSP for energy calculations.
+  /// Computes per-coefficient masking thresholds based on band energy and quality.
+  ///
+  /// Higher quality settings produce lower thresholds, allowing more spectral detail
+  /// to be preserved during quantization.
+  ///
+  /// - Parameters:
+  ///   - spectrum: MDCT spectral coefficients.
+  ///   - sampleRate: Sample rate for band table lookup.
+  ///   - quality: Quality level (0 = highest, 9 = lowest).
+  /// - Returns: Per-coefficient masking thresholds.
   static func maskingThresholds(spectrum: [Float], sampleRate: Int, quality: Int) -> [Float] {
     let bands = ScaleFactorBands.bandTable(for: sampleRate)
     let qualityScale = Float(max(0.1, Double(10 - quality) / 10.0))
@@ -1755,7 +1769,6 @@ private enum PsychoacousticModel {
         continue
       }
 
-      // Calculate energy using vDSP
       var energy: Float = 0
       spectrum.withUnsafeBufferPointer { ptr in
         vDSP_svesq(ptr.baseAddress! + start, 1, &energy, vDSP_Length(bandSize))
@@ -1775,17 +1788,16 @@ private enum PsychoacousticModel {
   }
 }
 
+/// Computes the `scalefac_compress` field from scale factor statistics.
 private enum ScaleFactorCompression {
-  /// Compresses scalefactors using vDSP for statistical calculations.
+  /// Returns a scalefac_compress index (0-15) based on scale factor variance.
   static func compress(scalefactors: [Float]) -> Int {
     guard !scalefactors.isEmpty else { return 0 }
     let count = vDSP_Length(scalefactors.count)
 
-    // Calculate mean using vDSP
     var mean: Float = 0
     vDSP_meanv(scalefactors, 1, &mean, count)
 
-    // Calculate variance: mean of squared differences from mean
     var centered = [Float](repeating: 0, count: scalefactors.count)
     var negMean = -mean
     vDSP_vsadd(scalefactors, 1, &negMean, &centered, 1, count)
@@ -1799,14 +1811,14 @@ private enum ScaleFactorCompression {
   }
 }
 
+/// Determines whether the pre-emphasis flag should be set for a granule.
 private enum PreEmphasis {
-  /// Determines if pre-emphasis should be enabled using vDSP for energy calculations.
+  /// Returns `true` if high-frequency energy significantly exceeds low-frequency energy.
   static func shouldEnable(spectral: [Float], scalefactors: [Float]) -> Bool {
     guard !spectral.isEmpty else { return false }
     let highStart = max(spectral.count * 3 / 4, 0)
     let highCount = spectral.count - highStart
 
-    // Calculate high frequency energy using vDSP
     var highEnergy: Float = 0
     if highCount > 0 {
       spectral.withUnsafeBufferPointer { ptr in
@@ -1814,13 +1826,11 @@ private enum PreEmphasis {
       }
     }
 
-    // Calculate low frequency energy using vDSP
     var lowEnergy: Float = 0
     if highStart > 0 {
       vDSP_svesq(spectral, 1, &lowEnergy, vDSP_Length(highStart))
     }
 
-    // Calculate scalefactor average using vDSP
     var scalefactorSum: Float = 0
     if !scalefactors.isEmpty {
       vDSP_sve(scalefactors, 1, &scalefactorSum, vDSP_Length(scalefactors.count))
@@ -1831,6 +1841,7 @@ private enum PreEmphasis {
   }
 }
 
+/// Side information fields for one granule of one channel (ISO 11172-3 Section 2.4.1.7).
 private struct GranuleInfo {
   var part23Length: Int = 0
   var bigValues: Int = 0
@@ -1848,23 +1859,25 @@ private struct GranuleInfo {
   var count1TableSelect: Int = 0
 }
 
+/// Simplified bit reservoir that keeps each frame self-contained (main_data_begin = 0).
 private struct BitReservoir {
-  // Simplified: no cross-frame buffering for maximum compatibility
-  // Each frame is self-contained with main_data_begin = 0
   private(set) var mainDataBegin: Int = 0
 
+  /// Returns the main data unchanged. No cross-frame buffering is used.
   mutating func consume(with mainData: Data) -> Data {
-    // Simply return the main data as-is
-    // main_data_begin stays 0 (data starts immediately after side info)
     return mainData
   }
 }
 
+/// Decides whether to use raw L/R stereo or mid/side encoding for joint stereo mode.
 private enum StereoDecision {
   case raw([Float], [Float])
   case midSide([Float], [Float])
 
-  /// Creates stereo decision using vDSP for mid/side calculation.
+  /// Evaluates whether mid/side encoding is beneficial for the given stereo pair.
+  ///
+  /// Mid/side encoding is chosen when the side (difference) channel has significantly
+  /// less energy than the mid (sum) channel, indicating high stereo correlation.
   static func make(mode: MP3EncoderOptions.Mode, left: [Float], right: [Float]) -> StereoDecision {
     guard mode == .jointStereo, left.count == right.count else {
       return .raw(left, right)
@@ -1872,13 +1885,11 @@ private enum StereoDecision {
 
     let count = left.count
 
-    // mid = (left + right) * 0.5
     var mid = [Float](repeating: 0, count: count)
     vDSP_vadd(left, 1, right, 1, &mid, 1, vDSP_Length(count))
     var halfScalar: Float = 0.5
     vDSP_vsmul(mid, 1, &halfScalar, &mid, 1, vDSP_Length(count))
 
-    // side = (left - right) * 0.5
     var side = [Float](repeating: 0, count: count)
     vDSP_vsub(right, 1, left, 1, &side, 1, vDSP_Length(count))
     vDSP_vsmul(side, 1, &halfScalar, &side, 1, vDSP_Length(count))
@@ -1891,6 +1902,7 @@ private enum StereoDecision {
     return .raw(left, right)
   }
 
+  /// Returns samples for the given channel index (0 = left/mid, 1 = right/side).
   func samples(for channel: Int) -> [Float] {
     switch self {
     case .raw(let left, let right):
@@ -1901,10 +1913,10 @@ private enum StereoDecision {
   }
 }
 
-// MARK: - UInt32 Big-Endian Extension
+// MARK: - UInt32 Extension
 
 private extension UInt32 {
-  /// Returns the value as 4 bytes in big-endian order.
+  /// The value serialized as 4 bytes in big-endian (network) byte order.
   var bigEndianBytes: [UInt8] {
     return [
       UInt8((self >> 24) & 0xFF),
@@ -1915,8 +1927,8 @@ private extension UInt32 {
   }
 }
 
+/// CRC-16 implementation using the MPEG polynomial (0x8005).
 private enum CRC16 {
-  /// Pre-computed CRC16 lookup table for MPEG polynomial 0x8005.
   private static let table: [UInt16] = {
     var table = [UInt16](repeating: 0, count: 256)
     for i in 0..<256 {
@@ -1933,7 +1945,7 @@ private enum CRC16 {
     return table
   }()
 
-  /// Computes CRC16 using lookup table.
+  /// Computes the MPEG CRC-16 checksum over the given data.
   static func mpeg(data: Data) -> UInt16 {
     var crc: UInt16 = 0xFFFF
     for byte in data {
@@ -1944,38 +1956,35 @@ private enum CRC16 {
   }
 }
 
+/// Bit-level writer for building MP3 frame headers, side information, and Huffman-coded data.
 private struct BitstreamWriter {
   private(set) var data = Data()
   private var buffer: UInt32 = 0
   private var bitsInBuffer: Int = 0
 
-  /// Total bits written so far.
+  /// Total number of bits written so far.
   var bitCount: Int {
     data.count * 8 + bitsInBuffer
   }
 
-  /// Writes multiple bits at once, more efficient than bit-by-bit.
+  /// Writes up to 24 bits at once in MSB-first order.
   mutating func write(bits: Int, count: Int) {
     guard count > 0 && count <= 24 else {
-      // Fall back to bit-by-bit for edge cases
       for i in (0..<count).reversed() {
         writeBit((bits >> i) & 1)
       }
       return
     }
 
-    // Add bits to buffer
     buffer = (buffer << count) | UInt32(bits & ((1 << count) - 1))
     bitsInBuffer += count
 
-    // Flush complete bytes
     while bitsInBuffer >= 8 {
       bitsInBuffer -= 8
       let byte = UInt8((buffer >> bitsInBuffer) & 0xFF)
       data.append(byte)
     }
 
-    // Mask buffer to keep only remaining bits
     if bitsInBuffer > 0 {
       buffer &= (1 << bitsInBuffer) - 1
     } else {
@@ -1994,6 +2003,7 @@ private struct BitstreamWriter {
     }
   }
 
+  /// Pads the bitstream to the next byte boundary with zero bits.
   mutating func padToByte() {
     if bitsInBuffer > 0 {
       let padding = 8 - bitsInBuffer
@@ -2005,18 +2015,17 @@ private struct BitstreamWriter {
   }
 }
 
+/// ISO 11172-3 lookup tables for MPEG-1 Layer III encoding.
 private enum MP3Tables {
+  /// A Huffman code table mapping value pairs to (bit length, codeword) entries.
   struct HuffmanTable {
     let maxValue: Int
     let table: [[(length: Int, bits: Int)]]
   }
 
-  // ==========================================================================
-  // ISO 11172-3 Table B.7 - Huffman code tables for MPEG-1 Layer III
-  // Format: (length, code) - length in bits, code is the Huffman codeword
-  // ==========================================================================
+  // MARK: Huffman Code Tables (ISO 11172-3 Table B.7)
 
-  /// Table 1: 2x2 for values 0-1
+  /// Table 1: 2x2 for values 0-1.
   static let table1 = HuffmanTable(
     maxValue: 1,
     table: [
@@ -2025,7 +2034,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 2: 3x3 for values 0-2
+  /// Table 2: 3x3 for values 0-2.
   static let table2 = HuffmanTable(
     maxValue: 2,
     table: [
@@ -2035,7 +2044,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 3: 3x3 for values 0-2
+  /// Table 3: 3x3 for values 0-2.
   static let table3 = HuffmanTable(
     maxValue: 2,
     table: [
@@ -2045,7 +2054,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 5: 4x4 for values 0-3
+  /// Table 5: 4x4 for values 0-3.
   static let table5 = HuffmanTable(
     maxValue: 3,
     table: [
@@ -2056,7 +2065,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 6: 4x4 for values 0-3
+  /// Table 6: 4x4 for values 0-3.
   static let table6 = HuffmanTable(
     maxValue: 3,
     table: [
@@ -2067,7 +2076,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 7: 6x6 for values 0-5
+  /// Table 7: 6x6 for values 0-5.
   static let table7 = HuffmanTable(
     maxValue: 5,
     table: [
@@ -2080,7 +2089,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 8: 6x6 for values 0-5
+  /// Table 8: 6x6 for values 0-5.
   static let table8 = HuffmanTable(
     maxValue: 5,
     table: [
@@ -2093,7 +2102,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 9: 6x6 for values 0-5
+  /// Table 9: 6x6 for values 0-5.
   static let table9 = HuffmanTable(
     maxValue: 5,
     table: [
@@ -2106,7 +2115,7 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 10: 8x8 for values 0-7
+  /// Table 10: 8x8 for values 0-7.
   static let table10 = HuffmanTable(
     maxValue: 7,
     table: [
@@ -2121,22 +2130,20 @@ private enum MP3Tables {
     ]
   )
 
-  /// Table 13: 16x16 for values 0-15
+  /// Table 13: 16x16 for values 0-15.
   static let table13 = HuffmanTable(
     maxValue: 15,
     table: Self.buildTable13()
   )
 
-  /// Table 15: 16x16 for values 0-15
+  /// Table 15: 16x16 for values 0-15.
   static let table15 = HuffmanTable(
     maxValue: 15,
     table: Self.buildTable15()
   )
 
-  /// Builds table 13: 16x16 for values 0-15
-  /// Codes from ISO 11172-3 Table B.7
+  /// Builds Huffman table 13 (16x16 for values 0-15).
   private static func buildTable13() -> [[(length: Int, bits: Int)]] {
-    // Huffman code lengths (linearized 16x16)
     let lengths: [Int] = [
       1, 4, 6, 7, 8, 9, 9, 10, 9, 10, 11, 11, 12, 12, 13, 13,
       3, 4, 6, 7, 8, 8, 9, 9, 9, 9, 10, 10, 11, 12, 12, 12,
@@ -2156,7 +2163,6 @@ private enum MP3Tables {
       12, 12, 13, 14, 14, 14, 15, 14, 15, 15, 16, 16, 19, 18, 19, 16
     ]
 
-    // Huffman codes (linearized 16x16)
     let codes: [Int] = [
       1, 5, 14, 21, 34, 51, 46, 71, 42, 52, 68, 52, 259, 172, 683, 275,
       3, 4, 12, 19, 31, 26, 44, 33, 31, 24, 32, 24, 31, 35, 22, 14,
@@ -2187,9 +2193,8 @@ private enum MP3Tables {
     return table
   }
 
-  /// Builds table 15: 16x16 for values 0-15.
+  /// Builds Huffman table 15 (16x16 for values 0-15, no linbits).
   private static func buildTable15() -> [[(length: Int, bits: Int)]] {
-    // Huffman code lengths (linearized 16x16)
     let lengths: [Int] = [
       3, 4, 5, 7, 7, 8, 9, 9, 9, 10, 10, 11, 11, 11, 12, 13,
       4, 3, 5, 6, 7, 7, 8, 8, 8, 9, 9, 10, 10, 10, 11, 11,
@@ -2209,7 +2214,6 @@ private enum MP3Tables {
       12, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 13, 13, 13, 13
     ]
 
-    // Huffman codes (linearized 16x16)
     let codes: [Int] = [
       7, 12, 18, 53, 47, 76, 124, 108, 89, 123, 108, 119, 107, 81, 122, 63,
       13, 5, 16, 27, 46, 36, 61, 51, 42, 70, 52, 83, 65, 41, 59, 36,
@@ -2240,6 +2244,9 @@ private enum MP3Tables {
     return table
   }
 
+  // MARK: Bitrate and Sample Rate Lookup
+
+  /// Returns the MPEG-1 Layer III bitrate index for a given bitrate in kbps.
   static func bitrateIndex(for bitrate: Int, sampleRate: Int) -> Int {
     let table: [Int]
     if sampleRate >= 32_000 {
@@ -2263,6 +2270,7 @@ private enum MP3Tables {
     return table[index]
   }
 
+  /// Returns the MPEG-1 sample rate index for a given sample rate in Hz.
   static func sampleRateIndex(for sampleRate: Int) -> Int {
     switch sampleRate {
     case 44_100:
@@ -2276,6 +2284,7 @@ private enum MP3Tables {
     }
   }
   
+  /// Returns the (mode, mode_extension) header bits for a channel mode.
   static func modeBits(for mode: MP3EncoderOptions.Mode) -> (Int, Int) {
     switch mode {
     case .mono:
