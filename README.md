@@ -8,11 +8,14 @@ A pure Swift MP3 encoder with no external dependencies beyond Apple's Accelerate
 - CBR and VBR encoding modes
 - Mono, stereo, and joint stereo
 - Streaming encoding — feed samples incrementally
+- Async/await support with `AsyncSequence` input
+- File encoding with automatic Xing header
 - Xing/Info header generation for accurate seeking
 - Psychoacoustic model with masking thresholds
 - Transient detection with short/long/mixed block switching
 - ISO 11172-3 compliant Huffman coding and polyphase filterbank
 - Uses Accelerate (vDSP/vForce) for vectorized DSP operations
+- Fully `Sendable` — safe to use from any concurrency context
 
 ## Requirements
 
@@ -42,48 +45,105 @@ Then add `"SwiftMP3"` as a dependency of your target:
 
 ### Basic Encoding
 
+Use `newSession()` to create a mutable encoding session for synchronous, incremental encoding:
+
 ```swift
 import SwiftMP3
 
-// Configure the encoder
-let options = MP3EncoderOptions(
+let encoder = MP3Encoder(options: MP3EncoderOptions(
   sampleRate: 44_100,
   bitrateKbps: 128,
   mode: .stereo
-)
-let encoder = MP3Encoder(options: options)
+))
+var session = encoder.newSession()
 
 // Feed interleaved PCM float samples (L, R, L, R, ...)
-let mp3Data = encoder.appendSamples(pcmSamples)
+var mp3Data = session.appendSamples(pcmSamples)
 
 // Flush any remaining buffered samples
-let finalData = encoder.flush()
+mp3Data.append(session.flush())
 
 // Generate a Xing header for accurate seeking (prepend to file)
-let xingHeader = encoder.makeXingHeader()
+let xingHeader = session.makeXingHeader()
 
 // Write the complete MP3 file
 var file = Data()
 file.append(xingHeader)
 file.append(mp3Data)
-file.append(finalData)
 ```
 
-### Streaming Encoding
+### Streaming Encode
 
-`appendSamples(_:)` buffers input and returns encoded MP3 data as soon as full frames (1152 samples per channel) are available. Call it repeatedly with chunks of any size:
+Use `encode(_:)` with any `AsyncSequence` of `[Float]` to get an `AsyncThrowingStream` of MP3 frame data:
 
 ```swift
 let encoder = MP3Encoder(options: options)
-var mp3File = Data()
 
-for chunk in audioChunks {
-  mp3File.append(encoder.appendSamples(chunk))
+for try await frame in encoder.encode(sampleSource) {
+  // Each `frame` is a Data containing one or more MP3 frames
+  send(frame)
 }
-mp3File.append(encoder.flush())
+```
 
-// Prepend Xing header for seekable output
-let complete = encoder.makeXingHeader() + mp3File
+### File Encode
+
+Use `encode(_:to:)` to write directly to a file, including the Xing header for seeking:
+
+```swift
+let encoder = MP3Encoder(options: options)
+try await encoder.encode(sampleSource, to: outputURL)
+```
+
+### Live Microphone Recording
+
+Feed audio from `AVAudioEngine` into an `AsyncStream` and encode to a file:
+
+```swift
+let engine = AVAudioEngine()
+let input = engine.inputNode
+let format = input.outputFormat(forBus: 0)
+
+let source = AsyncStream<[Float]> { continuation in
+  input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
+    let samples = Array(UnsafeBufferPointer(
+      start: buffer.floatChannelData?[0],
+      count: Int(buffer.frameLength)
+    ))
+    continuation.yield(samples)
+  }
+  continuation.onTermination = { _ in
+    input.removeTap(onBus: 0)
+    engine.stop()
+  }
+}
+
+try engine.start()
+let encoder = MP3Encoder(options: MP3EncoderOptions(mode: .mono))
+try await encoder.encode(source, to: recordingURL)
+```
+
+### Background Encoding
+
+`MP3Encoder` is `Sendable`, so you can create it on the main actor and hand it off to a background task:
+
+```swift
+let encoder = MP3Encoder(options: options)
+
+Task.detached {
+  try await encoder.encode(sampleSource, to: outputURL)
+}
+```
+
+### Network Streaming
+
+Encode and send frames over a network connection:
+
+```swift
+let encoder = MP3Encoder(options: options)
+
+for try await frame in encoder.encode(sampleSource) {
+  try await connection.send(frame)
+}
 ```
 
 ## API Reference
@@ -105,11 +165,21 @@ Configuration for the encoder.
 
 ### `MP3Encoder`
 
-The encoder instance. Not thread-safe — use from a single task or queue.
+Stateless, `Sendable` encoder that holds configuration. Safe to share across tasks.
+
+| Method | Description |
+|---|---|
+| `init(options:)` | Create an encoder with the given options |
+| `newSession() -> EncoderSession` | Create a mutable encoding session for synchronous use |
+| `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of sample buffers |
+| `encode(_:to:) async throws` | Encode an `AsyncSequence` directly to a file with Xing header |
+
+### `EncoderSession`
+
+Mutable encoding session created via `MP3Encoder.newSession()`. Not `Sendable` — use from a single context.
 
 | Method / Property | Description |
 |---|---|
-| `init(options:)` | Create an encoder with the given options |
 | `appendSamples(_: [Float]) -> Data` | Feed interleaved PCM samples, returns any complete MP3 frames |
 | `flush() -> Data` | Pads and encodes any remaining buffered samples |
 | `makeXingHeader() -> Data` | Generates a Xing/Info header frame (call after encoding is complete) |

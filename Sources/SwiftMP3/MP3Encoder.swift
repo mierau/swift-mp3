@@ -63,18 +63,120 @@ public struct MP3EncoderOptions: Sendable, Equatable {
 
 /// MPEG-1 Layer III (MP3) encoder.
 ///
-/// Encodes interleaved PCM float samples into MP3 frames. Supports CBR and VBR encoding
-/// with mono, stereo, and joint stereo modes.
+/// A stateless, `Sendable` value type that holds encoding configuration. Create an
+/// ``EncoderSession`` via ``newSession()`` for synchronous encoding, or use the async
+/// ``encode(_:)`` and ``encode(_:to:)`` methods for streaming and file output.
 ///
 /// Usage:
 /// ```swift
 /// let encoder = MP3Encoder(options: MP3EncoderOptions())
-/// var mp3Data = encoder.appendSamples(pcmSamples)
-/// mp3Data.append(encoder.flush())
-/// let finalData = encoder.makeXingHeader() + mp3Data
+/// var session = encoder.newSession()
+/// var mp3Data = session.appendSamples(pcmSamples)
+/// mp3Data.append(session.flush())
+/// let finalData = session.makeXingHeader() + mp3Data
 /// ```
-@preconcurrency
-public final class MP3Encoder {
+public struct MP3Encoder: Sendable {
+  /// The encoding configuration.
+  public let options: MP3EncoderOptions
+
+  /// Creates a new MP3 encoder with the given options.
+  /// - Parameter options: Configuration for sample rate, bitrate, channel mode, etc.
+  public init(options: MP3EncoderOptions) {
+    self.options = options
+  }
+
+  /// Creates a mutable encoding session for synchronous use.
+  public func newSession() -> EncoderSession {
+    EncoderSession(options: self.options)
+  }
+
+  /// Streaming encode: yields MP3 frames as `Data` chunks. No Xing header is included.
+  ///
+  /// - Parameter input: An async sequence of interleaved PCM float sample buffers.
+  /// - Returns: An `AsyncThrowingStream` that yields encoded MP3 frame data.
+  public func encode<S: AsyncSequence & Sendable>(
+    _ input: S
+  ) -> AsyncThrowingStream<Data, Error> where S.Element == [Float] {
+    let options = self.options
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        var state = EncoderSession(options: options)
+        do {
+          for try await samples in input {
+            try Task.checkCancellation()
+            let data = state.appendSamples(samples)
+            if !data.isEmpty {
+              continuation.yield(data)
+            }
+          }
+          let final = state.flush()
+          if !final.isEmpty {
+            continuation.yield(final)
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in
+        task.cancel()
+      }
+    }
+  }
+
+  /// File encode: writes MP3 frames incrementally to disk with a Xing header.
+  ///
+  /// Creates the file at `url`, writes encoded frames as they are produced, then
+  /// seeks back to the beginning to write the Xing header for accurate seeking.
+  ///
+  /// - Parameters:
+  ///   - input: An async sequence of interleaved PCM float sample buffers.
+  ///   - url: The file URL to write the MP3 output to.
+  public func encode<S: AsyncSequence & Sendable>(
+    _ input: S, to url: URL
+  ) async throws where S.Element == [Float] {
+    var state = EncoderSession(options: self.options)
+
+    // Calculate Xing frame size for the placeholder
+    let bitrateIndex = MP3Tables.bitrateIndex(for: self.options.bitrateKbps, sampleRate: self.options.sampleRate)
+    let bitrateValue = MP3Tables.bitrateValue(for: bitrateIndex)
+    let xingFrameSize = (144 * bitrateValue * 1000) / self.options.sampleRate
+
+    // Create the file with an empty placeholder for the Xing header
+    let placeholder = Data(count: xingFrameSize)
+    try placeholder.write(to: url)
+
+    let handle = try FileHandle(forWritingTo: url)
+    defer { try? handle.close() }
+
+    // Seek past the placeholder
+    try handle.seek(toOffset: UInt64(xingFrameSize))
+
+    for try await samples in input {
+      try Task.checkCancellation()
+      let data = state.appendSamples(samples)
+      if !data.isEmpty {
+        try handle.write(contentsOf: data)
+      }
+    }
+
+    let finalData = state.flush()
+    if !finalData.isEmpty {
+      try handle.write(contentsOf: finalData)
+    }
+
+    // Write the real Xing header at the start
+    let xingHeader = state.makeXingHeader()
+    try handle.seek(toOffset: 0)
+    try handle.write(contentsOf: xingHeader)
+  }
+}
+
+/// Mutable encoding state for synchronous MP3 encoding.
+///
+/// Holds all per-session state (PCM buffer, filterbank buffers, MDCT overlap, frame
+/// statistics, etc.). Created via ``MP3Encoder/newSession()``.
+public struct EncoderSession {
   private static let samplesPerFrame = 1152
   private static let subbands = 32
   private static let samplesPerGranule = 576
@@ -101,9 +203,9 @@ public final class MP3Encoder {
   /// The total bytes of encoded audio data so far (excluding the Xing header).
   public var encodedByteCount: UInt32 { totalBytes }
 
-  /// Creates a new MP3 encoder with the given options.
+  /// Creates a new encoding state with the given options.
   /// - Parameter options: Configuration for sample rate, bitrate, channel mode, etc.
-  public init(options: MP3EncoderOptions) {
+  init(options: MP3EncoderOptions) {
     self.options = options
     let channels = options.mode == .mono ? 1 : 2
 
@@ -126,7 +228,7 @@ public final class MP3Encoder {
   ///
   /// - Parameter samples: Interleaved PCM float samples.
   /// - Returns: Encoded MP3 data for any complete frames, or empty data if no frames were completed.
-  public func appendSamples(_ samples: [Float]) -> Data {
+  public mutating func appendSamples(_ samples: [Float]) -> Data {
     self.pcmBuffer.append(contentsOf: samples)
     var output = Data()
     let channels = self.options.mode == .mono ? 1 : 2
@@ -146,7 +248,7 @@ public final class MP3Encoder {
   /// Call this once after all samples have been passed to ``appendSamples(_:)``.
   ///
   /// - Returns: Encoded MP3 data for the final frame, or empty data if the buffer was empty.
-  public func flush() -> Data {
+  public mutating func flush() -> Data {
     if self.pcmBuffer.isEmpty {
       return Data()
     }
@@ -224,9 +326,6 @@ public final class MP3Encoder {
   }
 
   /// Generates the 100-byte TOC (Table of Contents) for seeking.
-  ///
-  /// Each entry maps a percentage point (0-99%) to a byte position scaled to 0-255.
-  /// Falls back to a linear distribution if no frames have been encoded.
   private func generateTOC() -> [UInt8] {
     guard !self.frameSizes.isEmpty else {
       return (0..<100).map { UInt8($0 * 255 / 99) }
@@ -254,12 +353,9 @@ public final class MP3Encoder {
 
     return toc
   }
-  
+
   /// Encodes a single MPEG-1 Layer III frame from PCM samples.
-  ///
-  /// - Parameter samples: Interleaved PCM samples for one frame (1152 samples per channel).
-  /// - Returns: A complete MP3 frame including header, side information, and main data.
-  private func encodeFrame(samples: [Float]) -> Data {
+  private mutating func encodeFrame(samples: [Float]) -> Data {
     let channels = self.options.mode == .mono ? 1 : 2
     let frameEnergy = FrameAnalysis.energy(samples: samples)
     let targetBitrate = self.options.vbr
@@ -323,18 +419,8 @@ public final class MP3Encoder {
 
     return frame
   }
-  
+
   /// Builds the MPEG-1 Layer III side information for a frame.
-  ///
-  /// Side information is 17 bytes for mono or 32 bytes for stereo and contains
-  /// granule parameters (gain, Huffman table selection, region boundaries, etc.)
-  /// needed by the decoder to interpret the main data.
-  ///
-  /// - Parameters:
-  ///   - channels: Number of audio channels (1 or 2).
-  ///   - granules: Granule parameters indexed as `[granule][channel]`.
-  ///   - scfsi: Scale factor selection info indexed as `[channel][band]`.
-  /// - Returns: Serialized side information data.
   private func buildSideInfo(channels: Int, granules: [[GranuleInfo]], scfsi: [[Int]]) -> Data {
     var writer = BitstreamWriter()
     let sideInfoBits = channels == 1 ? 136 : 256
@@ -390,18 +476,9 @@ public final class MP3Encoder {
     }
     return data
   }
-  
+
   /// Builds the main data and side information for a single frame.
-  ///
-  /// Processes samples through the full encoding pipeline: deinterleaving, stereo processing,
-  /// polyphase filterbank, MDCT, psychoacoustic analysis, quantization, and Huffman coding.
-  ///
-  /// - Parameters:
-  ///   - samples: Interleaved PCM samples for the frame.
-  ///   - channels: Number of audio channels.
-  ///   - targetMainDataSize: Target size in bytes for the main data section.
-  /// - Returns: A tuple of (main data, side information) as serialized bytes.
-  private func buildMainData(
+  private mutating func buildMainData(
     samples: [Float],
     channels: Int,
     targetMainDataSize: Int
@@ -507,18 +584,6 @@ public final class MP3Encoder {
   }
 
   /// Iteratively adjusts global gain to quantize spectral data within a bit budget.
-  ///
-  /// Increases the global gain (coarser quantization) until the Huffman-coded output
-  /// fits within `maxBits`. This is the outer rate-control loop of the encoder.
-  ///
-  /// - Parameters:
-  ///   - spectral: MDCT spectral coefficients for one granule.
-  ///   - scalefactors: Per-coefficient scale factors.
-  ///   - thresholds: Psychoacoustic masking thresholds.
-  ///   - initialGain: Starting global gain value (0-255).
-  ///   - maxBits: Maximum bits available for this granule.
-  ///   - writer: Bitstream writer to append Huffman-coded data to.
-  /// - Returns: A tuple of (final global gain, quantized values, bits written).
   private func quantizeToFitBudget(
     spectral: [Float],
     scalefactors: [Float],
@@ -582,15 +647,6 @@ public final class MP3Encoder {
   }
 
   /// Quantizes spectral coefficients at a specific global gain using vectorized operations.
-  ///
-  /// Applies the ISO 11172-3 power-law quantization formula:
-  /// `ix = nint(|xr|^0.75 / 2^((global_gain - 210) / 4))`,
-  /// clamped to the range of Huffman table 15 (0-15).
-  ///
-  /// - Parameters:
-  ///   - spectral: MDCT spectral coefficients.
-  ///   - globalGain: Quantizer step size control (0-255).
-  /// - Returns: Signed quantized values preserving the original sign of each coefficient.
   private func quantizeWithGain(spectral: [Float], globalGain: Int) -> [Int] {
     let stepPower = Double(globalGain - 210) / 4.0
     let quantizerStep = Float(max(pow(2.0, stepPower), 0.0001))
@@ -622,12 +678,6 @@ public final class MP3Encoder {
   }
 
   /// Estimates the number of Huffman-coded bits for a set of quantized values without writing.
-  ///
-  /// Uses table 15 (16x16, no linbits) for bit counting. This is used during the
-  /// gain iteration loop to test whether a quantization fits the bit budget.
-  ///
-  /// - Parameter values: Quantized spectral values (pairs encoded together).
-  /// - Returns: Total estimated bit count including sign bits.
   private func countHuffmanBits(_ values: [Int]) -> Int {
     var bits = 0
     var index = 0
@@ -656,14 +706,6 @@ public final class MP3Encoder {
   }
 
   /// Calculates region boundary indices for Huffman table region selection.
-  ///
-  /// The big_values area of each granule is divided into three regions, each of which
-  /// can use a different Huffman table. The boundaries align to scalefactor band edges.
-  ///
-  /// - Parameters:
-  ///   - bigValues: Number of Huffman-coded value pairs.
-  ///   - sampleRate: Sample rate used to look up scalefactor band widths.
-  /// - Returns: A tuple of (region0_count, region1_count) clamped to valid ranges.
   private func calculateRegionCounts(bigValues: Int, sampleRate: Int) -> (Int, Int) {
     let bigValuesRegion = bigValues * 2
     let bands = ScaleFactorBands.bandTable(for: sampleRate)
@@ -696,13 +738,8 @@ public final class MP3Encoder {
 
     return (min(region0Count, 15), min(region1Count, 7))
   }
-  
+
   /// Separates interleaved multi-channel samples into per-channel arrays using vDSP.
-  ///
-  /// - Parameters:
-  ///   - samples: Interleaved PCM samples (e.g. L, R, L, R, ...).
-  ///   - channels: Number of channels. Returns the input unchanged for mono.
-  /// - Returns: An array of per-channel sample arrays.
   private func deinterleave(samples: [Float], channels: Int) -> [[Float]] {
     guard channels > 1 else {
       return [samples]
@@ -728,17 +765,9 @@ public final class MP3Encoder {
 
     return result
   }
-  
+
   /// Processes PCM samples through the polyphase analysis filterbank.
-  ///
-  /// Feeds 32 samples at a time into the filterbank, producing 18 iterations
-  /// that yield 18 subband samples per subband (576 / 32 = 18).
-  ///
-  /// - Parameters:
-  ///   - samples: 576 PCM samples for one granule.
-  ///   - channel: Channel index for accessing the persistent filterbank buffer.
-  /// - Returns: 32 subbands, each containing 18 time-domain samples.
-  private func analyzeSubbands(_ samples: [Float], channel: Int) -> [[Float]] {
+  private mutating func analyzeSubbands(_ samples: [Float], channel: Int) -> [[Float]] {
     var subbands = Array(repeating: [Float](), count: Self.subbands)
 
     var offset = 0
@@ -768,16 +797,7 @@ public final class MP3Encoder {
   }
 
   /// Encodes one granule through the full spectral processing pipeline.
-  ///
-  /// Applies the polyphase filterbank, transient detection, MDCT, and psychoacoustic
-  /// analysis to produce frequency-domain coefficients ready for quantization.
-  ///
-  /// - Parameters:
-  ///   - samples: 576 PCM samples for one granule.
-  ///   - channel: Channel index for persistent filterbank and MDCT state.
-  ///   - sampleRate: Sample rate in Hz.
-  /// - Returns: Spectral analysis results including MDCT coefficients, gain, and block type.
-  private func encodeSpectrum(
+  private mutating func encodeSpectrum(
     _ samples: [Float],
     channel: Int,
     sampleRate: Int
@@ -817,14 +837,8 @@ public final class MP3Encoder {
       maskingThresholds: thresholds
     )
   }
-  
+
   /// Computes an initial global gain from the peak spectral magnitude.
-  ///
-  /// Solves for the gain that maps the peak value to the maximum of Huffman table 15 (value 15),
-  /// using the ISO 11172-3 quantization formula: `gain = 210 + 4 * log2(|peak|^0.75 / 15)`.
-  ///
-  /// - Parameter spectral: MDCT spectral coefficients.
-  /// - Returns: Global gain value in the range 0-255, or 210 for silence.
   private func computeGlobalGain(_ spectral: [Float]) -> Int {
     let peak = spectral.map { abs($0) }.max() ?? 0
 
@@ -845,16 +859,6 @@ public final class MP3Encoder {
   }
 
   /// Quantizes spectral coefficients using ISO 11172-3 power-law quantization.
-  ///
-  /// Applies `ix = nint(|xr|^0.75 / 2^((global_gain - 210) / 4))` and clamps
-  /// to the Huffman table 15 range of 0-15.
-  ///
-  /// - Parameters:
-  ///   - spectral: MDCT spectral coefficients.
-  ///   - scalefactors: Per-coefficient scale factors.
-  ///   - thresholds: Psychoacoustic masking thresholds.
-  ///   - globalGain: Quantizer step size control (0-255).
-  /// - Returns: Signed quantized values.
   private func quantizeSpectral(
     _ spectral: [Float],
     scalefactors: [Float],
@@ -938,12 +942,8 @@ private struct VBRState {
 
 /// ISO 11172-3 polyphase analysis filterbank for splitting PCM into 32 frequency subbands.
 private enum PolyphaseFilterbank {
-  /// Lazily-computed analysis matrix: `M[k][n] = cos((2k+1)(n-16) * PI/64)`.
-  nonisolated(unsafe) private static var analysisMatrix: [[Float]]?
-
-  /// Returns the 32x64 analysis cosine matrix, computing it on first access.
-  private static func getAnalysisMatrix() -> [[Float]] {
-    if let matrix = analysisMatrix { return matrix }
+  /// 32x64 analysis cosine matrix: `M[k][n] = cos((2k+1)(n-16) * PI/64)`.
+  private static let analysisMatrix: [[Float]] = {
     var matrix = [[Float]](repeating: [Float](repeating: 0, count: 64), count: 32)
     for k in 0..<32 {
       for n in 0..<64 {
@@ -951,9 +951,8 @@ private enum PolyphaseFilterbank {
         matrix[k][n] = Float(cos(angle))
       }
     }
-    analysisMatrix = matrix
     return matrix
-  }
+  }()
 
   /// ISO 11172-3 Table C.1 analysis window coefficients (512 values).
   private static let isoAnalysisWindow: [Float] = [
@@ -1103,10 +1102,6 @@ private enum PolyphaseFilterbank {
     0.000000477, 0.000000477, 0.000000477, 0.000000477
   ]
 
-  /// Returns the 512-tap analysis window coefficients.
-  private static func getAnalysisWindow() -> [Float] {
-    return isoAnalysisWindow
-  }
 
   /// Converts 32 new PCM samples into 32 subband samples.
   ///
@@ -1134,7 +1129,7 @@ private enum PolyphaseFilterbank {
       buffer[480 + i] = 0
     }
 
-    let window = getAnalysisWindow()
+    let window = isoAnalysisWindow
 
     // Step 1: Reverse and window the 512-sample buffer
     var reversed = buffer
@@ -1153,7 +1148,7 @@ private enum PolyphaseFilterbank {
     }
 
     // Step 3: Matrix multiply with cosine analysis matrix
-    let matrix = getAnalysisMatrix()
+    let matrix = analysisMatrix
     var subbands = [Float](repeating: 0, count: 32)
     for k in 0..<32 {
       var result: Float = 0
@@ -1172,17 +1167,8 @@ private enum PolyphaseFilterbank {
 /// Transforms subband samples from the polyphase filterbank into
 /// frequency-domain coefficients with overlap-add windowing.
 private enum MDCT {
-  nonisolated(unsafe) private static var longWindow: [Float]?
-  nonisolated(unsafe) private static var shortWindow: [Float]?
-  nonisolated(unsafe) private static var startWindow: [Float]?
-  nonisolated(unsafe) private static var stopWindow: [Float]?
-
-  nonisolated(unsafe) private static var longMDCTMatrix: [[Float]]?
-  nonisolated(unsafe) private static var shortMDCTMatrix: [[Float]]?
-
-  /// Returns the 18x36 long-block MDCT cosine matrix, computing it on first access.
-  private static func getLongMDCTMatrix() -> [[Float]] {
-    if let matrix = longMDCTMatrix { return matrix }
+  /// 18x36 long-block MDCT cosine matrix.
+  private static let longMDCTMatrix: [[Float]] = {
     let n = 36
     let halfN = 18
     var matrix = [[Float]](repeating: [Float](repeating: 0, count: n), count: halfN)
@@ -1192,13 +1178,11 @@ private enum MDCT {
         matrix[m][k] = Float(cos(angle))
       }
     }
-    longMDCTMatrix = matrix
     return matrix
-  }
+  }()
 
-  /// Returns the 6x12 short-block MDCT cosine matrix, computing it on first access.
-  private static func getShortMDCTMatrix() -> [[Float]] {
-    if let matrix = shortMDCTMatrix { return matrix }
+  /// 6x12 short-block MDCT cosine matrix.
+  private static let shortMDCTMatrix: [[Float]] = {
     let n = 12
     let halfN = 6
     var matrix = [[Float]](repeating: [Float](repeating: 0, count: n), count: halfN)
@@ -1208,37 +1192,31 @@ private enum MDCT {
         matrix[m][k] = Float(cos(angle))
       }
     }
-    shortMDCTMatrix = matrix
     return matrix
-  }
+  }()
 
-  /// Returns the 36-sample sine window for long blocks.
-  private static func getLongWindow() -> [Float] {
-    if let window = longWindow { return window }
+  /// 36-sample sine window for long blocks.
+  private static let longWindow: [Float] = {
     let n = 36
     var window = [Float](repeating: 0, count: n)
     for i in 0..<n {
       window[i] = Float(sin(Double.pi / Double(n) * (Double(i) + 0.5)))
     }
-    longWindow = window
     return window
-  }
+  }()
 
-  /// Returns the 12-sample sine window for short blocks.
-  private static func getShortWindow() -> [Float] {
-    if let window = shortWindow { return window }
+  /// 12-sample sine window for short blocks.
+  private static let shortWindow: [Float] = {
     let n = 12
     var window = [Float](repeating: 0, count: n)
     for i in 0..<n {
       window[i] = Float(sin(Double.pi / Double(n) * (Double(i) + 0.5)))
     }
-    shortWindow = window
     return window
-  }
+  }()
 
-  /// Returns the 36-sample start window for long-to-short block transitions.
-  private static func getStartWindow() -> [Float] {
-    if let window = startWindow { return window }
+  /// 36-sample start window for long-to-short block transitions.
+  private static let startWindow: [Float] = {
     var window = [Float](repeating: 0, count: 36)
     for i in 0..<18 {
       window[i] = Float(sin(Double.pi / 36.0 * (Double(i) + 0.5)))
@@ -1252,13 +1230,11 @@ private enum MDCT {
     for i in 30..<36 {
       window[i] = 0.0
     }
-    startWindow = window
     return window
-  }
+  }()
 
-  /// Returns the 36-sample stop window for short-to-long block transitions.
-  private static func getStopWindow() -> [Float] {
-    if let window = stopWindow { return window }
+  /// 36-sample stop window for short-to-long block transitions.
+  private static let stopWindow: [Float] = {
     var window = [Float](repeating: 0, count: 36)
     for i in 0..<6 {
       window[i] = 0.0
@@ -1272,9 +1248,8 @@ private enum MDCT {
     for i in 18..<36 {
       window[i] = Float(sin(Double.pi / 36.0 * (Double(i) + 0.5)))
     }
-    stopWindow = window
     return window
-  }
+  }()
 
   /// Applies MDCT to all 32 subbands for one granule with overlap-add.
   ///
@@ -1315,12 +1290,12 @@ private enum MDCT {
       let mdctCoeffs: [Float]
       switch blockType {
       case .long:
-        mdctCoeffs = mdctLong(samples: combined, window: getLongWindow())
+        mdctCoeffs = mdctLong(samples: combined, window: longWindow)
       case .short:
         mdctCoeffs = mdctShort(samples: combined)
       case .mixed:
         if sb < 2 {
-          mdctCoeffs = mdctLong(samples: combined, window: getLongWindow())
+          mdctCoeffs = mdctLong(samples: combined, window: longWindow)
         } else {
           mdctCoeffs = mdctShort(samples: combined)
         }
@@ -1398,7 +1373,7 @@ private enum MDCT {
     var windowed = [Float](repeating: 0, count: n)
     vDSP_vmul(samples, 1, window, 1, &windowed, 1, vDSP_Length(n))
 
-    let matrix = getLongMDCTMatrix()
+    let matrix = longMDCTMatrix
     var output = [Float](repeating: 0, count: halfN)
     for m in 0..<halfN {
       var result: Float = 0
@@ -1411,12 +1386,11 @@ private enum MDCT {
 
   /// Computes the MDCT for a short block (3 windows of 12 samples each, 18 total coefficients).
   private static func mdctShort(samples: [Float]) -> [Float] {
-    let shortWindow = getShortWindow()
     var output = [Float](repeating: 0, count: 18)
     let n = 12
     let normalization: Float = 3.0
 
-    let matrix = getShortMDCTMatrix()
+    let matrix = shortMDCTMatrix
 
     for w in 0..<3 {
       let offset = w * 6 + 6
