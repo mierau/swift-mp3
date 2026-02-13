@@ -71,9 +71,9 @@ public struct MP3EncoderOptions: Sendable, Equatable {
 /// ```swift
 /// let encoder = MP3Encoder(options: MP3EncoderOptions())
 /// var session = encoder.newSession()
-/// var mp3Data = session.appendSamples(pcmSamples)
+/// var mp3Data = session.encode(samples: pcmSamples)
 /// mp3Data.append(session.flush())
-/// let finalData = session.makeXingHeader() + mp3Data
+/// let finalData = session.generateXingHeader() + mp3Data
 /// ```
 public struct MP3Encoder: Sendable {
   /// The encoding configuration.
@@ -104,7 +104,7 @@ public struct MP3Encoder: Sendable {
         do {
           for try await samples in input {
             try Task.checkCancellation()
-            let data = state.appendSamples(samples)
+            let data = state.encode(samples: samples)
             if !data.isEmpty {
               continuation.yield(data)
             }
@@ -154,7 +154,7 @@ public struct MP3Encoder: Sendable {
 
     for try await samples in input {
       try Task.checkCancellation()
-      let data = state.appendSamples(samples)
+      let data = state.encode(samples: samples)
       if !data.isEmpty {
         try handle.write(contentsOf: data)
       }
@@ -166,7 +166,7 @@ public struct MP3Encoder: Sendable {
     }
 
     // Write the real Xing header at the start
-    let xingHeader = state.makeXingHeader()
+    let xingHeader = state.generateXingHeader()
     try handle.seek(toOffset: 0)
     try handle.write(contentsOf: xingHeader)
   }
@@ -228,7 +228,7 @@ public struct EncoderSession {
   ///
   /// - Parameter samples: Interleaved PCM float samples.
   /// - Returns: Encoded MP3 data for any complete frames, or empty data if no frames were completed.
-  public mutating func appendSamples(_ samples: [Float]) -> Data {
+  public mutating func encode(samples: [Float]) -> Data {
     self.pcmBuffer.append(contentsOf: samples)
     var output = Data()
     let channels = self.options.mode == .mono ? 1 : 2
@@ -245,7 +245,7 @@ public struct EncoderSession {
 
   /// Encodes any remaining buffered samples as a final frame, zero-padding if necessary.
   ///
-  /// Call this once after all samples have been passed to ``appendSamples(_:)``.
+  /// Call this once after all samples have been passed to ``encode(samples:)``.
   ///
   /// - Returns: Encoded MP3 data for the final frame, or empty data if the buffer was empty.
   public mutating func flush() -> Data {
@@ -270,7 +270,7 @@ public struct EncoderSession {
   /// "Xing" tag for VBR and "Info" tag for CBR streams.
   ///
   /// - Returns: A complete MP3 frame containing the Xing/Info header.
-  public func makeXingHeader() -> Data {
+  public func generateXingHeader() -> Data {
     let channels = self.options.mode == .mono ? 1 : 2
     let sideInfoSize = channels == 1 ? 17 : 32
 

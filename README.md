@@ -58,13 +58,13 @@ let encoder = MP3Encoder(options: MP3EncoderOptions(
 var session = encoder.newSession()
 
 // Feed interleaved PCM float samples (L, R, L, R, ...)
-var mp3Data = session.appendSamples(pcmSamples)
+var mp3Data = session.encode(samples: pcmSamples)
 
 // Flush any remaining buffered samples
 mp3Data.append(session.flush())
 
 // Generate a Xing header for accurate seeking (prepend to file)
-let xingHeader = session.makeXingHeader()
+let xingHeader = session.generateXingHeader()
 
 // Write the complete MP3 file
 var file = Data()
@@ -180,9 +180,9 @@ Mutable encoding session created via `MP3Encoder.newSession()`. Not `Sendable` â
 
 | Method / Property | Description |
 |---|---|
-| `appendSamples(_: [Float]) -> Data` | Feed interleaved PCM samples, returns any complete MP3 frames |
+| `encode(samples: [Float]) -> Data` | Feed interleaved PCM samples, returns any complete MP3 frames |
 | `flush() -> Data` | Pads and encodes any remaining buffered samples |
-| `makeXingHeader() -> Data` | Generates a Xing/Info header frame (call after encoding is complete) |
+| `generateXingHeader() -> Data` | Generates a Xing/Info header frame (call after encoding is complete) |
 | `encodedFrameCount: UInt32` | Number of MP3 frames encoded so far |
 | `encodedByteCount: UInt32` | Total bytes of encoded audio data so far |
 

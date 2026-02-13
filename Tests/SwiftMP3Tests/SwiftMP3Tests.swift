@@ -9,7 +9,7 @@ import Testing
 
   // Generate 1152 stereo samples of silence (one full frame)
   let silence = [Float](repeating: 0, count: 1152 * 2)
-  let data = state.appendSamples(silence)
+  let data = state.encode(samples:silence)
 
   // One full frame should produce output
   #expect(data.count > 0)
@@ -25,7 +25,7 @@ import Testing
   var state = encoder.newSession()
 
   let silence = [Float](repeating: 0, count: 1152)
-  let data = state.appendSamples(silence)
+  let data = state.encode(samples:silence)
 
   #expect(data.count > 0)
   #expect(data[0] == 0xFF)
@@ -38,7 +38,7 @@ import Testing
 
   // Feed less than a full frame
   let partial = [Float](repeating: 0, count: 500)
-  let appendData = state.appendSamples(partial)
+  let appendData = state.encode(samples:partial)
   #expect(appendData.count == 0) // Not enough for a frame yet
 
   let flushData = state.flush()
@@ -51,9 +51,9 @@ import Testing
   var state = encoder.newSession()
 
   let samples = [Float](repeating: 0, count: 1152 * 2)
-  _ = state.appendSamples(samples)
+  _ = state.encode(samples:samples)
 
-  let xing = state.makeXingHeader()
+  let xing = state.generateXingHeader()
   #expect(xing.count > 0)
 
   // Xing header should also start with MP3 sync word
@@ -84,7 +84,7 @@ import Testing
     samples.append(value) // Right
   }
 
-  let data = state.appendSamples(samples)
+  let data = state.encode(samples:samples)
   #expect(data.count > 0)
 }
 
