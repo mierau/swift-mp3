@@ -15,9 +15,12 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     case jointStereo
   }
 
-  /// Sample rate in Hz: 32000, 44100, or 48000.
+  /// Sample rate in Hz. 32000, 44100, and 48000 encode MPEG-1; 16000, 22050, and 24000
+  /// encode MPEG-2; 8000, 11025, and 12000 encode MPEG-2.5.
   public var sampleRate: Int
-  /// Bitrate in kbps for CBR, or the maximum average bitrate for VBR.
+  /// Bitrate in kbps for CBR, or the maximum average bitrate for VBR. MPEG-1 allows 32,
+  /// 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, and 320. MPEG-2 and 2.5 allow
+  /// 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, and 160.
   public var bitrateKbps: Int
   /// Whether to vary the bitrate frame by frame. Each frame gets the bits its masking
   /// threshold calls for, and the average stays at or below ``bitrateKbps``.
@@ -37,9 +40,9 @@ public struct MP3EncoderOptions: Sendable, Equatable {
 
   /// Creates a new set of encoder options.
   /// - Parameters:
-  ///   - sampleRate: Sample rate in Hz (32000, 44100, or 48000). Defaults to 44100.
-  ///   - bitrateKbps: Bitrate in kbps, rounded to the nearest MPEG-1 Layer III bitrate
-  ///     (32-320). Defaults to 128.
+  ///   - sampleRate: Sample rate in Hz. Defaults to 44100.
+  ///   - bitrateKbps: Bitrate in kbps; one of the bitrates for the sample rate's MPEG
+  ///     version. Defaults to 128.
   ///   - vbr: Vary the bitrate per frame, averaging at most `bitrateKbps`. Defaults to `false`.
   ///   - mode: Channel mode. Defaults to `.stereo`.
   ///   - quality: Quality level from 0 (best) to 9 (fastest). Defaults to 5.
@@ -62,7 +65,7 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     self.bitrateKbps = bitrateKbps
     self.vbr = vbr
     self.mode = mode
-    self.quality = max(0, min(quality, 9))
+    self.quality = quality
     self.crcProtected = crcProtected
     self.original = original
     self.copyright = copyright
@@ -73,7 +76,33 @@ public struct MP3EncoderOptions: Sendable, Equatable {
   var channelCount: Int { mode == .mono ? 1 : 2 }
 }
 
-/// MPEG-1 Layer III (MP3) encoder.
+/// An error from configuring the encoder or passing it input.
+public enum MP3EncoderError: Error, Equatable, Sendable, CustomStringConvertible {
+  /// The sample rate isn't one MP3 supports.
+  case unsupportedSampleRate(Int)
+  /// The bitrate isn't available at the sample rate's MPEG version.
+  case unsupportedBitrate(Int, sampleRate: Int)
+  /// The quality isn't in 0...9.
+  case invalidQuality(Int)
+  /// An audio buffer's sample rate, channel count, or sample format doesn't match the encoder.
+  case unsupportedBufferFormat(String)
+
+  public var description: String {
+    switch self {
+    case .unsupportedSampleRate(let rate):
+      return "Unsupported sample rate \(rate) Hz; expected one of \(MPEGVersion.allSampleRates.sorted())"
+    case .unsupportedBitrate(let kbps, let rate):
+      let allowed = MPEGVersion(sampleRate: rate).map { Array($0.bitrates.dropFirst()) } ?? []
+      return "Unsupported bitrate \(kbps) kbps at \(rate) Hz; expected one of \(allowed)"
+    case .invalidQuality(let quality):
+      return "Invalid quality \(quality); expected 0 through 9"
+    case .unsupportedBufferFormat(let reason):
+      return "Unsupported buffer format: \(reason)"
+    }
+  }
+}
+
+/// MPEG Layer III (MP3) encoder.
 ///
 /// A stateless, `Sendable` value type that holds encoding configuration. Create an
 /// ``EncoderSession`` via ``newSession()`` for synchronous encoding, or use the async
@@ -81,7 +110,7 @@ public struct MP3EncoderOptions: Sendable, Equatable {
 ///
 /// Usage:
 /// ```swift
-/// let encoder = MP3Encoder(options: MP3EncoderOptions())
+/// let encoder = try MP3Encoder(options: MP3EncoderOptions())
 /// var session = encoder.newSession()
 /// var mp3Data = session.encode(samples: pcmSamples)
 /// mp3Data.append(session.flush())
@@ -93,7 +122,17 @@ public struct MP3Encoder: Sendable {
 
   /// Creates a new MP3 encoder with the given options.
   /// - Parameter options: Configuration for sample rate, bitrate, channel mode, etc.
-  public init(options: MP3EncoderOptions) {
+  /// - Throws: ``MP3EncoderError`` if the sample rate, bitrate, or quality isn't supported.
+  public init(options: MP3EncoderOptions) throws {
+    guard let version = MPEGVersion(sampleRate: options.sampleRate) else {
+      throw MP3EncoderError.unsupportedSampleRate(options.sampleRate)
+    }
+    guard options.bitrateKbps > 0, version.bitrates.contains(options.bitrateKbps) else {
+      throw MP3EncoderError.unsupportedBitrate(options.bitrateKbps, sampleRate: options.sampleRate)
+    }
+    guard (0...9).contains(options.quality) else {
+      throw MP3EncoderError.invalidQuality(options.quality)
+    }
     self.options = options
   }
 

@@ -13,13 +13,14 @@ import Foundation
 /// output lags input by a few frames; ``flush()`` emits the remainder.
 public struct EncoderSession {
   private let options: MP3EncoderOptions
+  private let format: StreamFormat
   private let channels: Int
-  private let sampleRateIndex: Int
-  private let sideInfoSize: Int
+  /// `bitrate_index` of the configured bitrate: the CBR rate, or the VBR average.
+  private let targetBitrateIndex: Int
 
   // Input
   private var pcm: [Float] = []
-  private var inputFrames = 0
+  private var inputSamples = 0
   private var finished = false
 
   // Analysis
@@ -34,6 +35,7 @@ public struct EncoderSession {
   private var lateAttack: [Bool]
   private var lastBlockType: [BlockType]
   private let shortOrder: [Int]
+  private let lowpassHz: Int
   private let lowpassLong: Int
   private let lowpassShort: Int
 
@@ -59,24 +61,30 @@ public struct EncoderSession {
   private var mainDataOffset = 0
 
   // Statistics
-  private var frameCount: UInt32 = 0
-  private var totalBytes: UInt32 = 0
-  private var frameSizes: [Int] = []
+  private var frameCount = 0
+  private var totalBytes = 0
+  private var frameSizes: [UInt16] = []
+  /// CRC of the audio frames, for the LAME tag.
+  private var musicCRC: UInt16 = 0
+
+  /// The sample rate of the input, in Hz.
+  public var sampleRate: Int { format.sampleRate }
+
+  /// The number of interleaved channels in the input.
+  public var channelCount: Int { channels }
 
   /// The number of frames encoded so far.
-  public var encodedFrameCount: UInt32 { frameCount }
+  public var encodedFrameCount: Int { frameCount }
 
   /// The total bytes of encoded audio data so far (excluding the Xing header).
-  public var encodedByteCount: UInt32 { totalBytes }
+  public var encodedByteCount: Int { totalBytes }
 
-  /// Creates a new encoding state with the given options.
-  /// - Parameter options: Configuration for sample rate, bitrate, channel mode, etc.
+  /// Creates a new encoding state for options that ``MP3Encoder/init(options:)`` validated.
   init(options: MP3EncoderOptions) {
     self.options = options
     channels = options.channelCount
-    let srIndex = MPEG.sampleRateIndex(for: options.sampleRate) ?? 0
-    sampleRateIndex = srIndex
-    sideInfoSize = channels == 1 ? 17 : 32
+    format = StreamFormat(sampleRate: options.sampleRate, channels: channels)!
+    targetBitrateIndex = format.bitrateIndex(for: options.bitrateKbps)!
 
     let granule = [Float](repeating: 0, count: MPEG.samplesPerGranule)
     analyzers = Array(repeating: PolyphaseAnalyzer(), count: channels)
@@ -92,7 +100,7 @@ public struct EncoderSession {
     previousAllowedNoise = Array(repeating: [], count: channels)
 
     // Map short-block MDCT output (window, line) to scalefactor band order.
-    let shortBands = MPEG.shortBands(sampleRateIndex: srIndex)
+    let shortBands = format.shortBands
     var order = [Int](repeating: 0, count: 3 * 192)
     for band in 0..<13 {
       let width = shortBands[band + 1] - shortBands[band]
@@ -104,14 +112,14 @@ public struct EncoderSession {
     }
     shortOrder = order
 
-    let sampleRate = MPEG.sampleRates[srIndex]
-    let kbps = MPEG.bitrates[MPEG.bitrateIndex(for: options.bitrateKbps)]
-    let cutoff = Self.lowpassFrequency(kbps: kbps, channels: channels, sampleRate: sampleRate)
-    lowpassLong = min(576, Int((cutoff / Double(sampleRate / 2) * 576).rounded()))
-    lowpassShort = min(192, Int((cutoff / Double(sampleRate / 2) * 192).rounded()))
+    let sampleRate = format.sampleRate
+    let cutoff = Self.lowpassFrequency(kbps: options.bitrateKbps, channels: channels, sampleRate: sampleRate)
+    lowpassHz = Int(cutoff.rounded())
+    lowpassLong = min(576, Int((cutoff / (Double(sampleRate) / 2) * 576).rounded()))
+    lowpassShort = min(192, Int((cutoff / (Double(sampleRate) / 2) * 192).rounded()))
 
-    psychoacoustics = PsychoacousticModel(sampleRate: sampleRate, sampleRateIndex: srIndex, quality: options.quality)
-    quantizer = Quantizer(sampleRateIndex: srIndex, quality: options.quality)
+    psychoacoustics = PsychoacousticModel(format: format, quality: options.quality)
+    quantizer = Quantizer(format: format, quality: options.quality)
     frameSizes.reserveCapacity(4096)
   }
 
@@ -130,9 +138,46 @@ public struct EncoderSession {
 
   /// Appends interleaved PCM samples from a buffer and encodes any complete frames.
   public mutating func encode(samples: UnsafeBufferPointer<Float>) -> Data {
+    append(count: samples.count) { $0.append(contentsOf: samples) }
+  }
+
+  /// Appends interleaved 16-bit PCM samples and encodes any complete frames.
+  public mutating func encode(samples: [Int16]) -> Data {
+    samples.withUnsafeBufferPointer { encode(samples: $0) }
+  }
+
+  /// Appends interleaved 16-bit PCM samples from a buffer and encodes any complete frames.
+  public mutating func encode(samples: UnsafeBufferPointer<Int16>) -> Data {
+    append(count: samples.count) { pcm in
+      pcm.append(contentsOf: samples.lazy.map { Float($0) * (1 / 32_768) })
+    }
+  }
+
+  /// Appends non-interleaved PCM samples, one array per channel, and encodes any complete frames.
+  ///
+  /// - Parameter channels: One array per channel (left then right for stereo), all the
+  ///   same length, normalized to [-1.0, 1.0].
+  public mutating func encode(planar channels: [[Float]]) -> Data {
+    precondition(channels.count == self.channels, "Expected \(self.channels) channels, got \(channels.count)")
+    let length = channels.first?.count ?? 0
+    precondition(channels.allSatisfy { $0.count == length }, "Channels must have the same length")
+    if self.channels == 1 { return encode(samples: channels[0]) }
+    return append(count: length * 2) { pcm in
+      let left = channels[0]
+      let right = channels[1]
+      pcm.reserveCapacity(pcm.count + length * 2)
+      for i in 0..<length {
+        pcm.append(left[i])
+        pcm.append(right[i])
+      }
+    }
+  }
+
+  /// Adds `count` samples through `body` and encodes whatever they complete.
+  private mutating func append(count: Int, _ body: (inout [Float]) -> Void) -> Data {
     guard !finished else { return Data() }
-    pcm.append(contentsOf: samples)
-    inputFrames += samples.count / channels
+    body(&pcm)
+    inputSamples += count
     var output: [UInt8] = []
     processBufferedInput(into: &output)
     return Data(output)
@@ -148,13 +193,17 @@ public struct EncoderSession {
     guard !finished else { return Data() }
     finished = true
     var output: [UInt8] = []
-    guard inputFrames > 0 else { return Data() }
+    guard inputSamples > 0 else { return Data() }
 
+    // A trailing partial sample frame is completed with silence.
+    if pcm.count % channels != 0 {
+      pcm.append(contentsOf: repeatElement(0, count: channels - pcm.count % channels))
+    }
     // An input sample affects subband granules up to (n + 480) / 576; the MDCT needs one
     // more granule, and block-type lookahead one more after that.
-    let lastSubbandGranule = (inputFrames - 1 + 480) / MPEG.samplesPerGranule
-    let frames = (lastSubbandGranule + 2 + 1) / 2
-    let neededGranules = frames * 2 + 1
+    let lastSubbandGranule = (inputFrameCount - 1 + 480) / MPEG.samplesPerGranule
+    let frames = (lastSubbandGranule + 2 + format.granules - 1) / format.granules
+    let neededGranules = frames * format.granules + 1
     let missing = neededGranules * MPEG.samplesPerGranule - (subbandGranules * MPEG.samplesPerGranule + pcm.count / channels)
     if missing > 0 {
       pcm.append(contentsOf: repeatElement(0, count: missing * channels))
@@ -170,6 +219,9 @@ public struct EncoderSession {
     emitReadyFrames(into: &output)
     return Data(output)
   }
+
+  /// Number of input sample frames (one sample per channel) received so far.
+  private var inputFrameCount: Int { (inputSamples + channels - 1) / channels }
 
   /// Generates the ID3v2.3 tag data for the configured metadata.
   ///
@@ -287,9 +339,9 @@ public struct EncoderSession {
   /// Lowpass frequency for a bitrate, after LAME's bandwidth table for stereo.
   static func lowpassFrequency(kbps: Int, channels: Int, sampleRate: Int) -> Double {
     let table: [(Int, Double)] = [
-      (32, 5500), (40, 7000), (48, 7500), (56, 10_000), (64, 11_000), (80, 13_500),
-      (96, 15_100), (112, 15_600), (128, 17_000), (160, 17_500), (192, 18_600),
-      (224, 19_400), (256, 19_700), (320, 20_500),
+      (8, 2000), (16, 3700), (24, 3900), (32, 5500), (40, 7000), (48, 7500), (56, 10_000),
+      (64, 11_000), (80, 13_500), (96, 15_100), (112, 15_600), (128, 17_000), (160, 17_500),
+      (192, 18_600), (224, 19_400), (256, 19_700), (320, 20_500),
     ]
     // A mono stream gets the bandwidth of a stereo stream with twice the bitrate.
     let equivalent = Double(channels == 1 ? kbps * 2 : kbps)
@@ -310,7 +362,7 @@ public struct EncoderSession {
   // MARK: - Frame encoding
 
   private mutating func encodeReadyFrame(into output: inout [UInt8]) {
-    guard mdctGranules >= 2 else { return }
+    guard mdctGranules >= format.granules else { return }
     mdctGranules = 0
     encodeFrame()
     emitReadyFrames(into: &output)
@@ -318,8 +370,9 @@ public struct EncoderSession {
 
   private mutating func encodeFrame() {
     // Psychoacoustic analysis of the coded channels.
+    let granules = format.granules
     var masking = [[MaskingResult]]()
-    for gr in 0..<2 {
+    for gr in 0..<granules {
       var row = [MaskingResult]()
       for ch in 0..<channels {
         row.append(analyze(granule: gr, channel: ch))
@@ -328,23 +381,23 @@ public struct EncoderSession {
     }
 
     var useMidSide = false
-    var sideRatio = [Float](repeating: 0.5, count: 2)
+    var sideRatio = [Float](repeating: 0.5, count: granules)
     if options.mode == .jointStereo {
       (useMidSide, sideRatio) = decideMidSide(&masking)
     }
 
     // Bitrate and frame size.
     let totalPE = masking.joined().reduce(Float(0)) { $0 + $1.perceptualEntropy }
-    let sampleRate = MPEG.sampleRates[sampleRateIndex]
-    let crcSize = options.crcProtected ? 2 : 0
-    var bitrateIndex = MPEG.bitrateIndex(for: options.bitrateKbps)
+    let sampleRate = format.sampleRate
+    let crc = options.crcProtected
+    var bitrateIndex = targetBitrateIndex
     // VBR: quantize every granule just finely enough to mask its noise, then pick the
     // smallest bitrate that holds the result, capped by the average-bitrate target.
     var transparent: [[GranuleInfo]]?
     if options.vbr {
       var rows = [[GranuleInfo]]()
       var demand = 0
-      for gr in 0..<2 {
+      for gr in 0..<granules {
         var row = [GranuleInfo]()
         for ch in 0..<channels {
           let info = spectra[gr][ch].withUnsafeBufferPointer { spectrum in
@@ -363,10 +416,10 @@ public struct EncoderSession {
         }
         rows.append(row)
       }
-      let ceiling = bitrate.choose(targetKbps: options.bitrateKbps, sampleRate: sampleRate, perceptualEntropy: totalPE)
+      let ceiling = bitrate.choose(target: targetBitrateIndex, format: format, perceptualEntropy: totalPE)
       bitrateIndex = 1
       while bitrateIndex < ceiling {
-        let slotBits = (MPEG.frameLength(bitrateIndex: bitrateIndex, sampleRate: sampleRate) - 4 - crcSize - sideInfoSize) * 8
+        let slotBits = format.mainDataSize(frameLength: format.frameLength(bitrateIndex: bitrateIndex), crc: crc) * 8
         if demand <= slotBits + reservoirBits { break }
         bitrateIndex += 1
       }
@@ -374,30 +427,29 @@ public struct EncoderSession {
         transparent = rows
       }
     }
-    let numerator = 144_000 * MPEG.bitrates[bitrateIndex]
-    paddingRemainder += numerator % sampleRate
+    paddingRemainder += format.scaledFrameLength(bitrateIndex: bitrateIndex) % sampleRate
     let padding = paddingRemainder >= sampleRate
     if padding { paddingRemainder -= sampleRate }
-    let frameLength = MPEG.frameLength(bitrateIndex: bitrateIndex, sampleRate: sampleRate, padding: padding)
-    let slotSize = frameLength - 4 - crcSize - sideInfoSize
+    let frameLength = format.frameLength(bitrateIndex: bitrateIndex, padding: padding)
+    let slotSize = format.mainDataSize(frameLength: frameLength, crc: crc)
     let slotBits = slotSize * 8
-    let maxReservoir = max(0, min(511 * 8, 7680 - frameLength * 8)) & ~7
+    let maxReservoir = max(0, min(format.maxMainDataBegin * 8, 7680 - frameLength * 8)) & ~7
 
     let mainDataBegin = reservoirBits / 8
     var reservoir = reservoirBits
-    let meanBits = slotBits / 2
+    let meanBits = slotBits / granules
 
     for value in masking.joined().map(\.perceptualEntropy) {
       averageEntropy = averageEntropy == 0 ? max(value, 1) : averageEntropy + 0.02 * (value - averageEntropy)
     }
 
-    var granules = [[GranuleInfo]]()
+    var coded = [[GranuleInfo]]()
     var usedBits = 0
     if let transparent, transparent.joined().reduce(0, { $0 + $1.part23Length }) <= reservoirBits + slotBits {
-      granules = transparent
+      coded = transparent
       usedBits = transparent.joined().reduce(0) { $0 + $1.part23Length }
     } else {
-      for gr in 0..<2 {
+      for gr in 0..<granules {
         let pe = masking[gr].map(\.perceptualEntropy)
         let targets = Self.allocateBits(
           meanBits: meanBits,
@@ -423,27 +475,29 @@ public struct EncoderSession {
           row.append(info)
         }
         reservoir += meanBits
-        granules.append(row)
+        coded.append(row)
       }
     }
 
     // Share scalefactors between granules where they repeat.
     var scfsi = Array(repeating: [0, 0, 0, 0], count: channels)
-    for ch in 0..<channels {
-      let saved = applySCFSI(&granules[1][ch], first: granules[0][ch], scfsi: &scfsi[ch])
-      usedBits -= saved
+    if format.isMPEG1 {
+      for ch in 0..<channels {
+        let saved = applySCFSI(&coded[1][ch], first: coded[0][ch], scfsi: &scfsi[ch])
+        usedBits -= saved
+      }
     }
 
     // Main data.
     var writer = BitWriter(capacity: (usedBits + 7) / 8 + 8)
-    let longBands = MPEG.longBands(sampleRateIndex: sampleRateIndex)
-    for gr in 0..<2 {
+    let regions = quantizer.regions
+    for gr in 0..<granules {
       for ch in 0..<channels {
-        let info = granules[gr][ch]
+        let info = coded[gr][ch]
         let start = writer.bitCount
         writeScalefactors(info, granule: gr, scfsi: scfsi[ch], into: &writer)
         spectra[gr][ch].withUnsafeBufferPointer { spectrum in
-          HuffmanWriter.write(info, spectrum: spectrum.baseAddress!, longBands: longBands, into: &writer)
+          HuffmanWriter.write(info, spectrum: spectrum.baseAddress!, regions: regions, into: &writer)
         }
         assert(writer.bitCount - start == info.part23Length, "part2_3_length mismatch")
       }
@@ -465,7 +519,7 @@ public struct EncoderSession {
       bitrateIndex: bitrateIndex,
       padding: padding,
       midSide: useMidSide,
-      granules: granules,
+      granules: coded,
       scfsi: scfsi,
       mainDataBegin: mainDataBegin
     )
@@ -488,8 +542,9 @@ public struct EncoderSession {
   /// Converts the frame to mid/side when that needs fewer bits. Returns whether it did,
   /// and each granule's share of energy in the side channel.
   private mutating func decideMidSide(_ masking: inout [[MaskingResult]]) -> (Bool, [Float]) {
-    guard blockTypes[0][0] == blockTypes[0][1], blockTypes[1][0] == blockTypes[1][1] else {
-      return (false, [0.5, 0.5])
+    let granules = format.granules
+    guard (0..<granules).allSatisfy({ blockTypes[$0][0] == blockTypes[$0][1] }) else {
+      return (false, [Float](repeating: 0.5, count: granules))
     }
     let scale = Float(0.5).squareRoot()
     var mid = [[Float]]()
@@ -498,7 +553,7 @@ public struct EncoderSession {
     var ratios = [Float]()
     var entropyLR: Float = 0
     var entropyMS: Float = 0
-    for gr in 0..<2 {
+    for gr in 0..<granules {
       var m = [Float](repeating: 0, count: 576)
       var s = [Float](repeating: 0, count: 576)
       var midEnergy: Float = 0
@@ -532,7 +587,7 @@ public struct EncoderSession {
       midSideMasking.append(ms)
     }
     guard entropyMS < entropyLR else { return (false, ratios) }
-    for gr in 0..<2 {
+    for gr in 0..<granules {
       spectra[gr][0] = mid[gr]
       spectra[gr][1] = side[gr]
     }
@@ -665,6 +720,18 @@ public struct EncoderSession {
   }
 
   private func writeScalefactors(_ info: GranuleInfo, granule: Int, scfsi: [Int], into writer: inout BitWriter) {
+    if !format.isMPEG1 {
+      // MPEG-2: scalefactors in coding order, in groups that share an `slen`.
+      let (table, slen) = LSFScalefactors.decode(info.scalefacCompress)
+      var entry = 0
+      for (group, count) in LSFScalefactors.groups[table][info.isShort ? 1 : 0].enumerated() {
+        for e in entry..<(entry + count) {
+          writer.write(info.scalefactors[e], slen[group])
+        }
+        entry += count
+      }
+      return
+    }
     let (slen1, slen2) = MPEG.slen[info.scalefacCompress]
     if info.isShort {
       for band in 0..<12 {
@@ -693,40 +760,27 @@ public struct EncoderSession {
     scfsi: [[Int]],
     mainDataBegin: Int
   ) -> [UInt8] {
-    var header = BitWriter(capacity: 4)
-    header.write(0x7FF, 11)
-    header.write(0b11, 2)  // MPEG-1
-    header.write(0b01, 2)  // Layer III
-    header.write(options.crcProtected ? 0 : 1, 1)
-    header.write(bitrateIndex, 4)
-    header.write(sampleRateIndex, 2)
-    header.write(padding ? 1 : 0, 1)
-    header.write(0, 1)  // Private bit
-    let modeBits: Int
-    switch options.mode {
-    case .mono: modeBits = 0b11
-    case .jointStereo: modeBits = 0b01
-    case .stereo: modeBits = 0b00
-    }
-    header.write(modeBits, 2)
-    header.write(midSide ? 0b10 : 0b00, 2)
-    header.write(options.copyright ? 1 : 0, 1)
-    header.write(options.original ? 1 : 0, 1)
-    header.write(0, 2)  // No emphasis
+    var bytes = headerBytes(bitrateIndex: bitrateIndex, padding: padding, crc: options.crcProtected, midSide: midSide)
 
-    var side = BitWriter(capacity: sideInfoSize)
-    side.write(mainDataBegin, 9)
-    side.write(0, channels == 1 ? 5 : 3)
-    for ch in 0..<channels {
-      for g in 0..<4 { side.write(scfsi[ch][g], 1) }
+    let mpeg1 = format.isMPEG1
+    var side = BitWriter(capacity: format.sideInfoSize)
+    if mpeg1 {
+      side.write(mainDataBegin, 9)
+      side.write(0, channels == 1 ? 5 : 3)
+      for ch in 0..<channels {
+        for g in 0..<4 { side.write(scfsi[ch][g], 1) }
+      }
+    } else {
+      side.write(mainDataBegin, 8)
+      side.write(0, channels)
     }
-    for gr in 0..<2 {
+    for gr in 0..<format.granules {
       for ch in 0..<channels {
         let info = granules[gr][ch]
         side.write(info.part23Length, 12)
         side.write(info.bigValues, 9)
         side.write(info.globalGain, 8)
-        side.write(info.scalefacCompress, 4)
+        side.write(info.scalefacCompress, mpeg1 ? 4 : 9)
         if info.blockType != .normal {
           side.write(1, 1)
           side.write(info.blockType.rawValue, 2)
@@ -742,14 +796,17 @@ public struct EncoderSession {
           side.write(info.region0Count, 4)
           side.write(info.region1Count, 3)
         }
-        side.write(info.preflag, 1)
+        if mpeg1 {
+          // MPEG-2 derives preflag from scalefac_compress.
+          side.write(info.preflag, 1)
+        }
         side.write(info.scalefacScale, 1)
         side.write(info.count1TableSelect, 1)
       }
     }
     side.alignToByte()
+    assert(side.bytes.count == format.sideInfoSize)
 
-    var bytes = header.bytes
     if options.crcProtected {
       let crc = CRC16.mpeg(bytes[2...3], side.bytes[...])
       bytes.append(UInt8(crc >> 8))
@@ -759,6 +816,31 @@ public struct EncoderSession {
     return bytes
   }
 
+  /// The four-byte frame header.
+  private func headerBytes(bitrateIndex: Int, padding: Bool, crc: Bool, midSide: Bool) -> [UInt8] {
+    var header = BitWriter(capacity: 4)
+    header.write(0x7FF, 11)
+    header.write(format.version.headerBits, 2)
+    header.write(0b01, 2)  // Layer III
+    header.write(crc ? 0 : 1, 1)
+    header.write(bitrateIndex, 4)
+    header.write(format.sampleRateIndex, 2)
+    header.write(padding ? 1 : 0, 1)
+    header.write(0, 1)  // Private bit
+    let modeBits: Int
+    switch options.mode {
+    case .mono: modeBits = 0b11
+    case .jointStereo: modeBits = 0b01
+    case .stereo: modeBits = 0b00
+    }
+    header.write(modeBits, 2)
+    header.write(midSide ? 0b10 : 0b00, 2)
+    header.write(options.copyright ? 1 : 0, 1)
+    header.write(options.original ? 1 : 0, 1)
+    header.write(0, 2)  // No emphasis
+    return header.bytes
+  }
+
   /// Outputs every queued frame whose main data slot can be filled.
   private mutating func emitReadyFrames(into output: inout [UInt8]) {
     while pendingFrameIndex < pendingFrames.count {
@@ -766,13 +848,15 @@ public struct EncoderSession {
       guard mainData.count - mainDataOffset >= frame.slotSize else { break }
       output.append(contentsOf: frame.header)
       output.append(contentsOf: mainData[mainDataOffset..<(mainDataOffset + frame.slotSize)])
+      musicCRC = CRC16.lame(frame.header[...], continuing: musicCRC)
+      musicCRC = CRC16.lame(mainData[mainDataOffset..<(mainDataOffset + frame.slotSize)], continuing: musicCRC)
       mainDataOffset += frame.slotSize
       pendingFrameIndex += 1
 
       let size = frame.header.count + frame.slotSize
       frameCount += 1
-      totalBytes += UInt32(size)
-      frameSizes.append(size)
+      totalBytes += size
+      frameSizes.append(UInt16(size))
     }
     if pendingFrameIndex > 64 {
       pendingFrames.removeFirst(pendingFrameIndex)
@@ -786,61 +870,86 @@ public struct EncoderSession {
 
   // MARK: - Xing header
 
+  /// Samples of delay the encoder adds before the first input sample, not counting the
+  /// decoder's own 529-sample delay.
+  static let encoderDelay = 528
+
   /// Size of the Xing/Info frame produced by ``generateXingHeader()``.
   var xingFrameSize: Int {
-    MPEG.frameLength(bitrateIndex: xingBitrateIndex, sampleRate: MPEG.sampleRates[sampleRateIndex])
+    format.frameLength(bitrateIndex: xingBitrateIndex)
   }
 
-  /// Bitrate for the Xing frame: the stream's bitrate, raised if needed to fit the tag.
+  /// Bitrate for the Xing frame: the stream's bitrate, raised if needed to fit the tags.
   private var xingBitrateIndex: Int {
-    let needed = 4 + sideInfoSize + 4 + 4 + 4 + 4 + 100
-    var index = MPEG.bitrateIndex(for: options.bitrateKbps)
-    let sampleRate = MPEG.sampleRates[sampleRateIndex]
-    while index < 14 && MPEG.frameLength(bitrateIndex: index, sampleRate: sampleRate) < needed {
+    let needed = 4 + format.sideInfoSize + 120 + 36
+    var index = targetBitrateIndex
+    while index < 14 && format.frameLength(bitrateIndex: index) < needed {
       index += 1
     }
     return index
   }
 
-  /// Generates a Xing/Info header frame for seeking and duration metadata.
+  /// Generates a Xing/Info header frame for seeking, duration, and gapless playback.
   ///
   /// Call this after encoding is complete to get accurate frame and byte counts.
   /// The returned data should be prepended to the encoded audio data. Uses the
-  /// "Xing" tag for VBR and "Info" tag for CBR streams.
+  /// "Xing" tag for VBR and "Info" tag for CBR streams, followed by a LAME tag that
+  /// records the encoder delay and padding so players can trim them.
   ///
   /// - Returns: A complete MP3 frame containing the Xing/Info header.
   public func generateXingHeader() -> Data {
     let frameSize = xingFrameSize
-    var header = BitWriter(capacity: 4)
-    header.write(0x7FF, 11)
-    header.write(0b11, 2)
-    header.write(0b01, 2)
-    header.write(1, 1)  // No CRC
-    header.write(xingBitrateIndex, 4)
-    header.write(sampleRateIndex, 2)
-    header.write(0, 1)  // No padding
-    header.write(0, 1)
-    switch options.mode {
-    case .mono: header.write(0b11, 2)
-    case .jointStereo: header.write(0b01, 2)
-    case .stereo: header.write(0b00, 2)
-    }
-    header.write(0, 2)
-    header.write(options.copyright ? 1 : 0, 1)
-    header.write(options.original ? 1 : 0, 1)
-    header.write(0, 2)
-
-    var frame = header.bytes
-    frame.append(contentsOf: repeatElement(0, count: sideInfoSize))
+    var frame = headerBytes(bitrateIndex: xingBitrateIndex, padding: false, crc: false, midSide: false)
+    frame.append(contentsOf: repeatElement(0, count: format.sideInfoSize))
     frame.append(contentsOf: Array((options.vbr ? "Xing" : "Info").utf8))
-    frame.append(contentsOf: UInt32(0x07).bigEndianBytes)  // Frames, bytes, TOC
-    frame.append(contentsOf: frameCount.bigEndianBytes)
-    frame.append(contentsOf: (totalBytes + UInt32(frameSize)).bigEndianBytes)
+    frame.append(contentsOf: UInt32(0x0F).bigEndianBytes)  // Frames, bytes, TOC, quality
+    frame.append(contentsOf: UInt32(frameCount).bigEndianBytes)
+    let streamBytes = UInt32(clamping: totalBytes + frameSize)
+    frame.append(contentsOf: streamBytes.bigEndianBytes)
     frame.append(contentsOf: generateTOC(headerSize: frameSize))
+    frame.append(contentsOf: UInt32(100 - 10 * options.quality).bigEndianBytes)
+    frame.append(contentsOf: lameTag())
+    frame.append(contentsOf: streamBytes.bigEndianBytes)
+    frame.append(UInt8(musicCRC >> 8))
+    frame.append(UInt8(musicCRC & 0xFF))
+    let tagCRC = CRC16.lame(frame[...])
+    frame.append(UInt8(tagCRC >> 8))
+    frame.append(UInt8(tagCRC & 0xFF))
     if frame.count < frameSize {
       frame.append(contentsOf: repeatElement(0, count: frameSize - frame.count))
     }
     return Data(frame)
+  }
+
+  /// The LAME tag fields from the version string through the preset (28 bytes).
+  private func lameTag() -> [UInt8] {
+    var tag = Array("LAMESwMP3".utf8)
+    tag.append(options.vbr ? 2 : 1)  // Revision 0; VBR method: ABR or CBR
+    tag.append(UInt8(min(255, (lowpassHz + 50) / 100)))
+    tag.append(contentsOf: repeatElement(0, count: 8))  // Peak and ReplayGain
+    tag.append(0)  // Encoding flags and ATH type
+    tag.append(UInt8(min(255, options.bitrateKbps)))
+    let delay = Self.encoderDelay
+    let padding = min(max(frameCount * format.samplesPerFrame - delay - inputFrameCount, 0), 4095)
+    tag.append(UInt8(delay >> 4))
+    tag.append(UInt8((delay & 0xF) << 4 | padding >> 8))
+    tag.append(UInt8(padding & 0xFF))
+    let sourceRate: UInt8
+    switch format.sampleRate {
+    case ...32_000: sourceRate = 0
+    case 44_100: sourceRate = 1
+    default: sourceRate = 2
+    }
+    let stereoMode: UInt8
+    switch options.mode {
+    case .mono: stereoMode = 0
+    case .stereo: stereoMode = 1
+    case .jointStereo: stereoMode = 3
+    }
+    tag.append(sourceRate << 6 | stereoMode << 2)
+    tag.append(0)  // MP3 gain
+    tag.append(contentsOf: [0, 0])  // Surround and preset
+    return tag
   }
 
   /// The 100-entry seek table: byte position (scaled to 0-255) of each percent of duration.
@@ -848,7 +957,7 @@ public struct EncoderSession {
     guard !frameSizes.isEmpty else {
       return (0..<100).map { UInt8($0 * 255 / 99) }
     }
-    let total = Double(Int(totalBytes) + headerSize)
+    let total = Double(totalBytes + headerSize)
     var toc = [UInt8]()
     toc.reserveCapacity(100)
     var position = headerSize
@@ -856,7 +965,7 @@ public struct EncoderSession {
     for percent in 0..<100 {
       let target = percent * frameSizes.count / 100
       while frame < target {
-        position += frameSizes[frame]
+        position += Int(frameSizes[frame])
         frame += 1
       }
       toc.append(UInt8(min(255, Int(Double(position) / total * 256))))
@@ -900,8 +1009,8 @@ struct BitrateController {
   private var targetBytes: Double = 0
   private var actualBytes: Double = 0
 
-  mutating func choose(targetKbps: Int, sampleRate: Int, perceptualEntropy: Float) -> Int {
-    let target = 144_000 * Double(targetKbps) / Double(sampleRate)
+  mutating func choose(target targetIndex: Int, format: StreamFormat, perceptualEntropy: Float) -> Int {
+    let target = Double(format.scaledFrameLength(bitrateIndex: targetIndex)) / Double(format.sampleRate)
     if averageEntropy == 0 { averageEntropy = max(perceptualEntropy, 1) }
     averageEntropy += 0.02 * (perceptualEntropy - averageEntropy)
     let ratio = Double(min(max(perceptualEntropy / max(averageEntropy, 1), 0.5), 2))
@@ -912,7 +1021,7 @@ struct BitrateController {
     let desired = target * ratio + drift
     targetBytes += target
     var index = 1
-    while index < 14 && Double(MPEG.frameLength(bitrateIndex: index, sampleRate: sampleRate)) < desired {
+    while index < 14 && Double(format.frameLength(bitrateIndex: index)) < desired {
       index += 1
     }
     return index
@@ -925,6 +1034,26 @@ struct BitrateController {
 
 /// CRC-16 with the MPEG polynomial (0x8005), initialized to 0xFFFF.
 enum CRC16 {
+  /// Table for the reflected form of the polynomial (0xA001) used by LAME tags.
+  private static let reflectedTable: [UInt16] = (0..<256).map { byte in
+    var crc = UInt16(byte)
+    for _ in 0..<8 {
+      crc = crc & 1 != 0 ? (crc >> 1) ^ 0xA001 : crc >> 1
+    }
+    return crc
+  }
+
+  /// The LAME tag's CRC-16 (reflected, initialized to 0), continued from `crc`.
+  static func lame(_ bytes: ArraySlice<UInt8>, continuing crc: UInt16 = 0) -> UInt16 {
+    var crc = crc
+    reflectedTable.withUnsafeBufferPointer { table in
+      for byte in bytes {
+        crc = (crc >> 8) ^ table[Int((crc ^ UInt16(byte)) & 0xFF)]
+      }
+    }
+    return crc
+  }
+
   static func mpeg(_ parts: ArraySlice<UInt8>...) -> UInt16 {
     var crc: UInt16 = 0xFFFF
     for part in parts {

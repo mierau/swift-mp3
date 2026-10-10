@@ -29,6 +29,8 @@ jobs:
     container: swift:6.0
     steps:
       - uses: actions/checkout@v5
+      - name: Install ffmpeg
+        run: apt-get update && apt-get install -y --no-install-recommends ffmpeg
       - name: Build
         run: swift build -v
       - name: Test

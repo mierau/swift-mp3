@@ -31,11 +31,33 @@ struct GranuleInfo {
   var isShort: Bool { blockType == .short }
 
   /// The big-values region boundaries `(region1Start, region2Start)` in lines.
-  func regionBoundaries(longBands: [Int]) -> (Int, Int) {
-    if blockType != .normal {
-      return (36, 576)
+  func regionBoundaries(_ regions: RegionLayout) -> (Int, Int) {
+    switch blockType {
+    case .normal:
+      return (regions.longBands[region0Count + 1], regions.longBands[region0Count + region1Count + 2])
+    case .short:
+      return (regions.shortRegion1, 576)
+    case .start, .stop:
+      return (regions.switchedRegion1, 576)
     }
-    return (longBands[region0Count + 1], longBands[region0Count + region1Count + 2])
+  }
+}
+
+/// Where the big-values regions of a granule begin, for one sample rate.
+struct RegionLayout {
+  let longBands: [Int]
+  /// `region1` start for short blocks, and for start and stop blocks.
+  let shortRegion1: Int
+  let switchedRegion1: Int
+  /// Decoders disagree on the window-switching region boundary at 8 kHz, so both
+  /// regions there use one table and the boundary doesn't matter.
+  let singleSwitchedTable: Bool
+
+  init(format: StreamFormat) {
+    longBands = format.longBands
+    shortRegion1 = format.shortBands[3] * 3
+    switchedRegion1 = format.longBands[8]
+    singleSwitchedTable = format.sampleRate == 8_000
   }
 }
 
@@ -96,7 +118,7 @@ private struct Distortion {
 struct Quantizer {
   static let maxQuantized: Int32 = 8206
 
-  let longBands: [Int]
+  let regions: RegionLayout
   private let longLayout: BandLayout
   private let shortLayout: BandLayout
 
@@ -117,10 +139,14 @@ struct Quantizer {
     return Float(rounded) > v ? rounded - 1 : rounded
   }
 
-  init(sampleRateIndex: Int, quality: Int) {
-    longBands = MPEG.longBands(sampleRateIndex: sampleRateIndex)
-    longLayout = BandLayout(long: longBands)
-    shortLayout = BandLayout(short: MPEG.shortBands(sampleRateIndex: sampleRateIndex))
+  /// Whether scalefactors use the MPEG-2 coding (`scalefac_compress` with nine bits).
+  private let lsf: Bool
+
+  init(format: StreamFormat, quality: Int) {
+    regions = RegionLayout(format: format)
+    longLayout = BandLayout(long: format.longBands)
+    shortLayout = BandLayout(short: format.shortBands)
+    lsf = !format.isMPEG1
     switch quality {
     case 0...2: iterations = 40
     case 3...5: iterations = 24
@@ -138,7 +164,8 @@ struct Quantizer {
     maxBits: Int
   ) -> GranuleInfo {
     let layout = blockType == .short ? shortLayout : longLayout
-    let longBands = self.longBands
+    let regions = self.regions
+    let lsf = self.lsf
     let iterations = self.iterations
     let searchRegions = self.searchRegions
     return floats.withUnsafeMutableBufferPointer { floats in
@@ -148,7 +175,8 @@ struct Quantizer {
           absXR: floats.baseAddress! + 576,
           ix: ix.baseAddress!,
           layout: layout,
-          longBands: longBands,
+          regions: regions,
+          lsf: lsf,
           allowedNoise: allowedNoise
         )
         return work.run(
@@ -172,7 +200,8 @@ extension Quantizer {
     allowedNoise: [Float]
   ) -> GranuleInfo? {
     let layout = blockType == .short ? shortLayout : longLayout
-    let longBands = self.longBands
+    let regions = self.regions
+    let lsf = self.lsf
     let searchRegions = self.searchRegions
     return floats.withUnsafeMutableBufferPointer { floats in
       ix.withUnsafeMutableBufferPointer { ix in
@@ -181,7 +210,8 @@ extension Quantizer {
           absXR: floats.baseAddress! + 576,
           ix: ix.baseAddress!,
           layout: layout,
-          longBands: longBands,
+          regions: regions,
+          lsf: lsf,
           allowedNoise: allowedNoise
         )
         return work.runTransparent(spectrum: spectrum, blockType: blockType, searchRegions: searchRegions)
@@ -196,7 +226,8 @@ private struct GranuleQuantization {
   let absXR: UnsafeMutablePointer<Float>
   let ix: UnsafeMutablePointer<Int32>
   let layout: BandLayout
-  let longBands: [Int]
+  let regions: RegionLayout
+  let lsf: Bool
   let allowedNoise: [Float]
   let huffman = HuffmanTables.flat
   let tables = QuantTables.shared
@@ -211,14 +242,16 @@ private struct GranuleQuantization {
     absXR: UnsafeMutablePointer<Float>,
     ix: UnsafeMutablePointer<Int32>,
     layout: BandLayout,
-    longBands: [Int],
+    regions: RegionLayout,
+    lsf: Bool,
     allowedNoise: [Float]
   ) {
     self.xr34 = xr34
     self.absXR = absXR
     self.ix = ix
     self.layout = layout
-    self.longBands = longBands
+    self.regions = regions
+    self.lsf = lsf
     self.allowedNoise = allowedNoise
     self.noise = [Float](repeating: 0, count: layout.count)
   }
@@ -537,8 +570,10 @@ private struct GranuleQuantization {
 
   // MARK: - Scalefactors
 
-  /// Chooses `scalefac_compress` and returns the scalefactor bit count.
+  /// Chooses `scalefac_compress` and returns the scalefactor bit count, or 4096 if the
+  /// scalefactors can't be coded.
   func part2Bits(_ info: inout GranuleInfo) -> Int {
+    if lsf { return lsfPart2Bits(&info) }
     var max1 = 0
     var max2 = 0
     let split = info.isShort ? 18 : 11
@@ -557,6 +592,32 @@ private struct GranuleQuantization {
       }
     }
     info.scalefacCompress = bestIndex
+    return bestBits == Int.max ? 4096 : bestBits
+  }
+
+  /// MPEG-2 scalefactor coding: picks the partition table and `slen` per group.
+  private func lsfPart2Bits(_ info: inout GranuleInfo) -> Int {
+    let kind = info.isShort ? 1 : 0
+    var bestBits = Int.max
+    for table in info.preflag == 1 ? [2] : [0, 1] {
+      var slen = [0, 0, 0, 0]
+      var bits = 0
+      var entry = 0
+      var fits = true
+      for group in 0..<4 {
+        let count = LSFScalefactors.groups[table][kind][group]
+        var largest = 0
+        for e in entry..<(entry + count) { largest = max(largest, info.scalefactors[e]) }
+        entry += count
+        while largest >= (1 << slen[group]) { slen[group] += 1 }
+        if slen[group] > LSFScalefactors.maxSlen[table][group] { fits = false }
+        bits += count * slen[group]
+      }
+      if fits && bits < bestBits {
+        bestBits = bits
+        info.scalefacCompress = LSFScalefactors.compress(table: table, slen: slen)
+      }
+    }
     return bestBits == Int.max ? 4096 : bestBits
   }
 
@@ -596,6 +657,7 @@ private struct GranuleQuantization {
     var bits = min(quads.a, quads.b)
 
     let bigEnd = i
+    let longBands = regions.longBands
     if info.blockType == .normal {
       if bigEnd == 0 {
         info.region0Count = 0
@@ -613,8 +675,13 @@ private struct GranuleQuantization {
     } else {
       info.region0Count = 7
       info.region1Count = 0
+      if regions.singleSwitchedTable {
+        let t = huffman.chooseTable(ix, 0, bigEnd)
+        info.tableSelect = [t.table, t.table, 0]
+        return bits + t.bits
+      }
     }
-    let (a1, a2) = info.regionBoundaries(longBands: longBands)
+    let (a1, a2) = info.regionBoundaries(regions)
     let r1 = min(a1, bigEnd)
     let r2 = min(a2, bigEnd)
     let t0 = huffman.chooseTable(ix, 0, r1)
@@ -629,7 +696,8 @@ private struct GranuleQuantization {
   func optimizeRegions(_ info: inout GranuleInfo, total: Int) -> Int {
     let bigEnd = info.bigValues * 2
     guard bigEnd > 0 else { return total }
-    let (a1, a2) = info.regionBoundaries(longBands: longBands)
+    let longBands = regions.longBands
+    let (a1, a2) = info.regionBoundaries(regions)
     let currentBig = huffman.count(ix, 0, min(a1, bigEnd), table: info.tableSelect[0])
       + huffman.count(ix, min(a1, bigEnd), min(a2, bigEnd), table: info.tableSelect[1])
       + huffman.count(ix, min(a2, bigEnd), bigEnd, table: info.tableSelect[2])
@@ -663,6 +731,41 @@ private struct GranuleQuantization {
     info.region1Count = best.1
     info.tableSelect = best.2
     return count1Bits + bestBits
+  }
+}
+
+/// MPEG-2 scalefactor partitions (ISO/IEC 13818-3, 2.4.3.2), without intensity stereo.
+enum LSFScalefactors {
+  /// Scalefactors per group, `[table][long or short][group]`. Short-block counts are
+  /// band × window entries.
+  static let groups = [
+    [[6, 5, 5, 5], [9, 9, 9, 9]],
+    [[6, 5, 7, 3], [9, 9, 12, 6]],
+    [[11, 10, 0, 0], [18, 18, 0, 0]],
+  ]
+  /// Largest `slen` each table can signal per group.
+  static let maxSlen = [[4, 4, 3, 3], [4, 4, 3, 0], [3, 2, 0, 0]]
+
+  /// The nine-bit `scalefac_compress` for a table and its `slen` values. Table 2 implies `preflag`.
+  static func compress(table: Int, slen: [Int]) -> Int {
+    switch table {
+    case 0: return ((slen[0] * 5 + slen[1]) << 4) + (slen[2] << 2) + slen[3]
+    case 1: return 400 + ((slen[0] * 5 + slen[1]) << 2) + slen[2]
+    default: return 500 + slen[0] * 3 + slen[1]
+    }
+  }
+
+  /// The table and `slen` values encoded by a `scalefac_compress`.
+  static func decode(_ compress: Int) -> (table: Int, slen: [Int]) {
+    if compress < 400 {
+      return (0, [(compress >> 4) / 5, (compress >> 4) % 5, (compress & 15) >> 2, compress & 3])
+    }
+    if compress < 500 {
+      let c = compress - 400
+      return (1, [(c >> 2) / 5, (c >> 2) % 5, c & 3, 0])
+    }
+    let c = compress - 500
+    return (2, [c / 3, c % 3, 0, 0])
   }
 }
 

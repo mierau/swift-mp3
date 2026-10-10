@@ -214,14 +214,14 @@ enum HuffmanWriter {
   static func write(
     _ info: GranuleInfo,
     spectrum: UnsafePointer<Float>,
-    longBands: [Int],
+    regions: RegionLayout,
     into writer: inout BitWriter
   ) {
     let tables = HuffmanTables.flat
     info.quantized.withUnsafeBufferPointer { q in
       let ix = q.baseAddress!
       let bigEnd = info.bigValues * 2
-      let (a1, a2) = info.regionBoundaries(longBands: longBands)
+      let (a1, a2) = info.regionBoundaries(regions)
       let r1 = min(a1, bigEnd)
       let r2 = min(a2, bigEnd)
       writePairs(ix, spectrum, 0, r1, table: info.tableSelect[0], tables, &writer)
