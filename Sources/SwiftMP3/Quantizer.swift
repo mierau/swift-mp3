@@ -109,6 +109,14 @@ struct Quantizer {
   private var floats = [Float](repeating: 0, count: 576 * 2)
   private var ix = [Int32](repeating: 0, count: 576)
 
+  /// `floor(v)` for `0 <= v < 2^22`, without the range checks of `Int32(_:)`.
+  @inline(__always)
+  static func floor(_ v: Float) -> Int32 {
+    // Adding 2^23 leaves the value rounded to an integer in the low mantissa bits.
+    let rounded = Int32(bitPattern: (v + 8_388_608).bitPattern) - 0x4B00_0000
+    return Float(rounded) > v ? rounded - 1 : rounded
+  }
+
   init(sampleRateIndex: Int, quality: Int) {
     longBands = MPEG.longBands(sampleRateIndex: sampleRateIndex)
     longLayout = BandLayout(long: longBands)
@@ -401,8 +409,8 @@ private struct GranuleQuantization {
     let pow43 = tables.pow43
     var sum: Float = 0
     for i in layout.start[band]..<layout.end[band] {
-      let v = xr34[i] * inverse
-      var q = Int(v)
+      let v = min(xr34[i] * inverse, 8206)
+      var q = Int(Quantizer.floor(v))
       if v - Float(q) >= threshold[q] { q += 1 }
       let d = absXR[i] - pow43[q] * scale
       sum += d * d
@@ -490,12 +498,12 @@ private struct GranuleQuantization {
       let step = tables.inverseStep(stepExponent(info, band: band))
       for i in start..<end {
         let v = xr34[i] * step
-        if v >= 8206 {
+        guard v < 8206 else {
           ok = false
           ix[i] = Quantizer.maxQuantized
           continue
         }
-        var q = Int32(v)
+        var q = Quantizer.floor(v)
         if v - Float(q) >= threshold[Int(q)] { q += 1 }
         ix[i] = q
       }
@@ -629,18 +637,19 @@ private struct GranuleQuantization {
 
     var bestBits = currentBig
     var best = (info.region0Count, info.region1Count, info.tableSelect)
+    let costs = RegionCosts(ix, end: bigEnd, bands: longBands, tables: huffman)
     var r2Cost = [(table: Int, bits: Int)]()
     r2Cost.reserveCapacity(23)
     for boundary in 0..<23 {
-      r2Cost.append(huffman.chooseTable(ix, min(longBands[boundary], bigEnd), bigEnd))
+      r2Cost.append(costs.chooseTable(from: boundary, to: 22))
     }
     for r0 in 0..<16 {
       let a1 = min(longBands[r0 + 1], bigEnd)
-      let c0 = huffman.chooseTable(ix, 0, a1)
+      let c0 = costs.chooseTable(from: 0, to: r0 + 1)
       if c0.bits >= bestBits { break }
       for r1 in 0..<8 where r0 + r1 + 2 <= 22 {
         let a2 = min(longBands[r0 + r1 + 2], bigEnd)
-        let c1 = huffman.chooseTable(ix, a1, a2)
+        let c1 = costs.chooseTable(from: r0 + 1, to: r0 + r1 + 2)
         let bits = c0.bits + c1.bits + r2Cost[r0 + r1 + 2].bits
         if bits < bestBits {
           bestBits = bits
