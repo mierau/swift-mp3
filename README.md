@@ -1,5 +1,9 @@
 # SwiftMP3
 
+[![CI](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml/badge.svg)](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml)
+[![Swift Versions](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fmierau%2Fswift-mp3%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/mierau/swift-mp3)
+[![Platforms](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fmierau%2Fswift-mp3%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/mierau/swift-mp3)
+
 A pure Swift MP3 encoder with no external dependencies beyond Apple's Accelerate framework. Encode PCM audio to MPEG-1 Layer III (MP3) entirely in Swift.
 
 ## Features
@@ -22,6 +26,7 @@ A pure Swift MP3 encoder with no external dependencies beyond Apple's Accelerate
 
 - Swift 5.10+
 - macOS 13+, iOS 16+, tvOS 16+, watchOS 9+, visionOS 1+
+- Xcode 16+ to run the tests (Swift Testing)
 
 ## Installation
 
@@ -33,14 +38,18 @@ dependencies: [
 ]
 ```
 
-Then add `"SwiftMP3"` as a dependency of your target:
+Then add `SwiftMP3` as a dependency of your target:
 
 ```swift
 .target(
   name: "MyApp",
-  dependencies: ["SwiftMP3"]
+  dependencies: [
+    .product(name: "SwiftMP3", package: "swift-mp3")
+  ]
 )
 ```
+
+In Xcode, choose **File › Add Package Dependencies…** and enter the repository URL.
 
 ## Usage
 
@@ -238,6 +247,17 @@ Input samples are interleaved `Float` values in the range `-1.0` to `1.0`:
 
 - **Mono**: `[s0, s1, s2, ...]`
 - **Stereo / Joint Stereo**: `[L0, R0, L1, R1, L2, R2, ...]`
+
+## Documentation
+
+API documentation is available on the [Swift Package Index](https://swiftpackageindex.com/mierau/swift-mp3/documentation/swiftmp3), or can be built locally in Xcode with **Product › Build Documentation**.
+
+## Development
+
+```sh
+swift build
+swift test
+```
 
 ## License
 

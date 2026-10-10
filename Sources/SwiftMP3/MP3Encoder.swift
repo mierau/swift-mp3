@@ -57,8 +57,11 @@ public struct ID3Tag: Sendable, Equatable {
 public struct MP3EncoderOptions: Sendable, Equatable {
   /// The channel mode for the encoded audio.
   public enum Mode: String, Sendable, Equatable {
+    /// A single audio channel.
     case mono
+    /// Two independently encoded channels.
     case stereo
+    /// Two channels encoded with mid/side stereo where beneficial.
     case jointStereo
   }
 
