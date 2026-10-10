@@ -23,6 +23,17 @@ jobs:
       - name: Test
         run: swift test -v
 
+  linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: swift build -v
+      - name: Test
+        run: swift test -v
+
   build:
     name: Build (${{ matrix.platform }})
     runs-on: macos-15

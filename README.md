@@ -2,29 +2,31 @@
 
 [![CI](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml/badge.svg)](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml)
 
-A pure Swift MP3 encoder with no external dependencies beyond Apple's Accelerate framework. Encode PCM audio to MPEG-1 Layer III (MP3) entirely in Swift.
+A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG-1 Layer III (MP3) entirely in Swift, on Apple platforms and Linux.
 
 ## Features
 
 - MPEG-1 Layer III encoding at 32kHz, 44.1kHz, and 48kHz sample rates
-- CBR and VBR encoding modes
+- CBR and VBR encoding modes, with a bit reservoir
 - Mono, stereo, and joint stereo
 - Streaming encoding — feed samples incrementally
 - Async/await support with `AsyncSequence` input
 - File encoding with automatic Xing header
 - Xing/Info header generation for accurate seeking
-- Psychoacoustic model with masking thresholds
-- Transient detection with short/long/mixed block switching
+- Psychoacoustic model (spreading, tonality, absolute threshold of hearing, pre-echo control)
+- Noise-shaping quantization with scalefactors, pre-emphasis, and scalefactor sharing
+- Transient detection with long/short block switching
+- Mid/side stereo chosen per frame
 - ISO 11172-3 compliant Huffman coding and polyphase filterbank
-- Uses Accelerate (vDSP/vForce) for vectorized DSP operations
+- Encodes 50-200x faster than realtime on one core
 - ID3v2.3 metadata tagging (title, artist, album, artwork, etc.)
 - Fully `Sendable` — safe to use from any concurrency context
 
 ## Requirements
 
 - Swift 5.10+
-- macOS 13+, iOS 16+, tvOS 16+, watchOS 9+, visionOS 1+
-- Xcode 16+ to run the tests (Swift Testing)
+- macOS 13+, iOS 16+, tvOS 16+, watchOS 9+, visionOS 1+, or Linux
+- Swift 6 toolchain (Xcode 16+) to run the tests (Swift Testing); the decode round-trip tests use AVFoundation and run on Apple platforms
 
 ## Installation
 
@@ -189,8 +191,8 @@ Configuration for the encoder.
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `sampleRate` | `Int` | `44_100` | Input sample rate (32000, 44100, or 48000) |
-| `bitrateKbps` | `Int` | `128` | Target bitrate in kbps (32-320) |
-| `vbr` | `Bool` | `false` | Enable variable bitrate encoding |
+| `bitrateKbps` | `Int` | `128` | Bitrate in kbps (32-320); the maximum average for VBR |
+| `vbr` | `Bool` | `false` | Give each frame only the bits its masking threshold calls for |
 | `mode` | `Mode` | `.stereo` | Channel mode: `.mono`, `.stereo`, or `.jointStereo` |
 | `quality` | `Int` | `5` | Encoding quality 0 (best) to 9 (fastest) |
 | `crcProtected` | `Bool` | `false` | Add CRC error detection to frames |

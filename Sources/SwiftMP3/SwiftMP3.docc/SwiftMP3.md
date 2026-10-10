@@ -4,7 +4,7 @@ Encode PCM audio to MP3 in pure Swift.
 
 ## Overview
 
-SwiftMP3 is an MPEG-1 Layer III encoder written entirely in Swift, using Accelerate for vectorized DSP. It supports CBR and VBR encoding, mono, stereo, and joint stereo, ID3v2.3 metadata, and Xing/Info headers for accurate seeking.
+SwiftMP3 is an MPEG-1 Layer III encoder written entirely in Swift with no dependencies. It supports CBR and VBR encoding, mono, stereo, and joint stereo, ID3v2.3 metadata, and Xing/Info headers for accurate seeking.
 
 Create an ``MP3Encoder`` with a set of ``MP3EncoderOptions``, then encode synchronously with an ``EncoderSession``, or asynchronously from any `AsyncSequence` of sample buffers.
 
