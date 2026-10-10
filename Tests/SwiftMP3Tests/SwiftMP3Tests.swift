@@ -1,13 +1,10 @@
 import Foundation
 import Testing
 @testable import SwiftMP3
-#if canImport(AVFoundation)
-import AVFoundation
-#endif
 
 @Test func encodeSilence() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // Generate 1152 stereo samples of silence (one full frame)
@@ -25,7 +22,7 @@ import AVFoundation
 
 @Test func encodeMono() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .mono)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   let silence = [Float](repeating: 0, count: 1152)
@@ -38,7 +35,7 @@ import AVFoundation
 
 @Test func flushProducesFinalFrame() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // Feed less than a full frame
@@ -52,7 +49,7 @@ import AVFoundation
 
 @Test func xingHeader() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   let samples = [Float](repeating: 0, count: 1152 * 2)
@@ -78,7 +75,7 @@ import AVFoundation
 
 @Test func encodeSineWave() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // Generate a 440Hz sine wave, one frame of stereo samples
@@ -97,7 +94,7 @@ import AVFoundation
 
 @Test func encodeAsyncStream() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
 
   // Create an AsyncStream of sine wave chunks
   let source = AsyncStream<[Float]> { continuation in
@@ -129,7 +126,7 @@ import AVFoundation
 
 @Test func encodeToFile() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
 
   let url = FileManager.default.temporaryDirectory.appendingPathComponent("test_\(UUID().uuidString).mp3")
   defer { try? FileManager.default.removeItem(at: url) }
@@ -171,7 +168,7 @@ import AVFoundation
 
 @Test func encodeEmptyStream() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
 
   let source = AsyncStream<[Float]> { continuation in
     continuation.finish()
@@ -187,10 +184,10 @@ import AVFoundation
 
 // MARK: - ID3 Tag Tests
 
-@Test func id3TagGeneration() {
+@Test func id3TagGeneration() throws {
   let tag = ID3Tag(title: "Test Song", artist: "Test Artist", album: "Test Album")
   let options = MP3EncoderOptions(id3Tag: tag)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   let session = encoder.newSession()
 
   let data = session.generateID3Tag()
@@ -224,7 +221,7 @@ import AVFoundation
 @Test func encodeToFileWithID3() async throws {
   let tag = ID3Tag(title: "My Song", artist: "Artist", album: "Album")
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo, id3Tag: tag)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
 
   let url = FileManager.default.temporaryDirectory.appendingPathComponent("test_id3_\(UUID().uuidString).mp3")
   defer { try? FileManager.default.removeItem(at: url) }
@@ -288,14 +285,14 @@ import AVFoundation
   #expect(data.count > fakeJPEG.count)
 }
 
-@Test func id3EmptyFields() {
+@Test func id3EmptyFields() throws {
   let tag = ID3Tag()
   let data = ID3TagWriter.build(tag: tag)
   #expect(data.isEmpty)
 
   // EncoderSession with no tag also returns empty
   let options = MP3EncoderOptions()
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   let session = encoder.newSession()
   #expect(session.generateID3Tag().isEmpty)
 }
@@ -304,7 +301,7 @@ import AVFoundation
 
 @Test func bitReservoirMainDataBegin() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // Encode 12 frames of a low-amplitude sine wave — produces Huffman data
@@ -363,7 +360,7 @@ import AVFoundation
 
 @Test func framePadding() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // Encode 100 frames — at 128kbps/44.1kHz we expect a mix of 417 and 418-byte frames
@@ -406,9 +403,9 @@ import AVFoundation
 
 // MARK: - Latency Tests
 
-@Test func firstEncodeIsBufferedUntilEnoughInput() {
+@Test func firstEncodeIsBufferedUntilEnoughInput() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // The filterbank, MDCT overlap, and block-switching lookahead delay output by about a frame.
@@ -424,9 +421,9 @@ import AVFoundation
   #expect(output[1] & 0xE0 == 0xE0)
 }
 
-@Test func flushEmitsBufferedFrames() {
+@Test func flushEmitsBufferedFrames() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   let samples = [Float](repeating: 0, count: 1152 * 2)
@@ -439,9 +436,9 @@ import AVFoundation
   #expect(flushed[1] & 0xE0 == 0xE0)
 }
 
-@Test func doubleFlushReturnsEmpty() {
+@Test func doubleFlushReturnsEmpty() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   let samples = [Float](repeating: 0, count: 1152 * 2)
@@ -454,9 +451,9 @@ import AVFoundation
   #expect(second.isEmpty, "Second flush should return empty — nothing left to emit")
 }
 
-@Test func frameCountAndByteCountAccuracy() {
+@Test func frameCountAndByteCountAccuracy() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   let frameTarget = 10
@@ -468,8 +465,8 @@ import AVFoundation
   totalOutput.append(state.flush())
 
   // One extra frame carries the tail delayed by the filterbank.
-  #expect(state.encodedFrameCount == UInt32(frameTarget + 1))
-  #expect(state.encodedByteCount == UInt32(totalOutput.count))
+  #expect(state.encodedFrameCount == frameTarget + 1)
+  #expect(state.encodedByteCount == totalOutput.count)
 
   // At 128kbps/44.1kHz, each frame is 417 or 418 bytes
   let averageFrameSize = Double(totalOutput.count) / Double(frameTarget + 1)
@@ -477,9 +474,9 @@ import AVFoundation
     "Average frame size should be ~417-418 bytes, got \(averageFrameSize)")
 }
 
-@Test func mainDataBeginStaysWithinEarlierFrames() {
+@Test func mainDataBeginStaysWithinEarlierFrames() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // A quiet sine followed by a loud chirp fills the reservoir, then drains it.
@@ -517,7 +514,7 @@ import AVFoundation
 
 @Test func monoReservoirWorks() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .mono)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   // Mono has 17-byte side info (vs 32 stereo), giving a larger main data slot
@@ -544,10 +541,10 @@ import AVFoundation
   #expect(modeBits == 3, "Mode bits should be 0b11 for mono, got \(modeBits)")
 }
 
-@Test func multiFrameOutputContiguousFrames() {
+@Test func multiFrameOutputContiguousFrames() throws {
   // Verify output is a sequence of contiguous valid frames with no gaps
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   var allData = Data()
@@ -597,15 +594,15 @@ import AVFoundation
 // MARK: - Helpers
 
 /// Encodes a sine wave and returns complete MP3 file data with Xing header.
-private func makeTestMP3(
+func makeTestMP3(
   sampleRate: Int = 44_100,
   bitrateKbps: Int = 128,
   mode: MP3EncoderOptions.Mode = .stereo,
   amplitude: Float = 0.5,
   frameCount: Int = 20
-) -> Data {
+) throws -> Data {
   let options = MP3EncoderOptions(sampleRate: sampleRate, bitrateKbps: bitrateKbps, mode: mode)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
   let channels = mode == .mono ? 1 : 2
 
@@ -645,10 +642,10 @@ private func frameBitrates(_ data: Data) -> [Int] {
   return offset == bytes.count ? result : []
 }
 
-@Test func vbrSpendsFewerBitsOnSimpleSignals() {
-  func encode(vbr: Bool) -> Data {
+@Test func vbrSpendsFewerBitsOnSimpleSignals() throws {
+  func encode(vbr: Bool) throws -> Data {
     let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 192, vbr: vbr, mode: .jointStereo)
-    var state = MP3Encoder(options: options).newSession()
+    var state = try MP3Encoder(options: options).newSession()
     var samples = [Float]()
     for i in 0..<(44_100 * 2) {
       let value = sin(2 * .pi * 440 * Float(i) / 44_100) * 0.5
@@ -659,17 +656,17 @@ private func frameBitrates(_ data: Data) -> [Int] {
     data.append(state.flush())
     return data
   }
-  let cbr = encode(vbr: false)
-  let vbr = encode(vbr: true)
+  let cbr = try encode(vbr: false)
+  let vbr = try encode(vbr: true)
   let bitrates = frameBitrates(vbr)
   #expect(!bitrates.isEmpty, "VBR output should be a contiguous run of valid frames")
   #expect(Set(bitrates).count > 1 || bitrates.first.map { $0 < 192 } == true)
   #expect(vbr.count * 2 < cbr.count, "VBR \(vbr.count) bytes vs CBR \(cbr.count) bytes")
 }
 
-@Test func vbrAverageStaysAtOrBelowTarget() {
+@Test func vbrAverageStaysAtOrBelowTarget() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, vbr: true, mode: .jointStereo)
-  var state = MP3Encoder(options: options).newSession()
+  var state = try MP3Encoder(options: options).newSession()
   // Uncorrelated noise needs every bit it can get.
   var generator = SystemRandomNumberGenerator()
   var data = Data()
@@ -684,233 +681,12 @@ private func frameBitrates(_ data: Data) -> [Int] {
   #expect(average <= 128 * 1.1, "Average bitrate \(average) kbps")
 }
 
-#if canImport(AVFoundation)
-/// Writes data to a temp .mp3 file and returns the URL.
-private func writeTempMP3(_ data: Data) throws -> URL {
-  let url = FileManager.default.temporaryDirectory
-    .appendingPathComponent("test_\(UUID().uuidString).mp3")
-  try data.write(to: url)
-  return url
-}
-
-/// Decodes an MP3 file and returns the processing format and PCM buffer.
-private func decodeMP3(at url: URL) throws -> (format: AVAudioFormat, buffer: AVAudioPCMBuffer) {
-  let audioFile = try AVAudioFile(forReading: url)
-  let format = audioFile.processingFormat
-  let frameCount = AVAudioFrameCount(audioFile.length)
-  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
-  try audioFile.read(into: buffer)
-  return (format, buffer)
-}
-
-private func peak(_ samples: [Float]) -> Float {
-  samples.reduce(0) { max($0, abs($1)) }
-}
-
-private func rms(_ samples: [Float]) -> Float {
-  (samples.reduce(0) { $0 + $1 * $1 } / Float(max(samples.count, 1))).squareRoot()
-}
-
-/// Encodes `input` (interleaved), decodes it, aligns the result, and returns the
-/// signal-to-noise ratio in dB and the output/input level ratio of the first channel.
-private func roundTrip(
-  _ input: [Float],
-  channels: Int,
-  options: MP3EncoderOptions
-) throws -> (snr: Double, gain: Double) {
-  var state = MP3Encoder(options: options).newSession()
-  var data = state.encode(samples: input)
-  data.append(state.flush())
-  let url = try writeTempMP3(state.generateXingHeader() + data)
-  defer { try? FileManager.default.removeItem(at: url) }
-  let (_, buffer) = try decodeMP3(at: url)
-  let decoded = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength)))
-  let reference = stride(from: 0, to: input.count, by: channels).map { input[$0] }
-
-  // Find the decoder delay by cross-correlating a window from the middle.
-  let window = Array(reference[8192..<16384])
-  var bestLag = 0
-  var bestScore = -Double.infinity
-  for lag in 0..<4096 where 8192 + lag + window.count <= decoded.count {
-    var score = 0.0
-    for i in Swift.stride(from: 0, to: window.count, by: 4) {
-      score += Double(window[i]) * Double(decoded[8192 + lag + i])
-    }
-    if score > bestScore {
-      bestScore = score
-      bestLag = lag
-    }
-  }
-  var signal = 0.0
-  var noise = 0.0
-  var output = 0.0
-  for i in 4096..<(reference.count - 4096) where i + bestLag < decoded.count {
-    let a = Double(reference[i])
-    let b = Double(decoded[i + bestLag])
-    signal += a * a
-    noise += (a - b) * (a - b)
-    output += b * b
-  }
-  return (10 * log10(signal / max(noise, 1e-20)), (output / max(signal, 1e-20)).squareRoot())
-}
-
-/// A few seconds of a chord with vibrato and a decaying pluck, which exercises tonal
-/// masking, block switching, and the bit reservoir.
-private func musicLikeSignal(sampleRate: Int, channels: Int, seconds: Double = 3) -> [Float] {
-  let count = Int(Double(sampleRate) * seconds)
-  var output = [Float]()
-  output.reserveCapacity(count * channels)
-  let notes: [Float] = [220, 277.18, 329.63, 440, 659.25]
-  for i in 0..<count {
-    let t = Float(i) / Float(sampleRate)
-    var value: Float = 0
-    for (k, f) in notes.enumerated() {
-      value += sin(2 * .pi * f * t + 0.3 * sin(2 * .pi * 5 * t)) * 0.08 / Float(k + 1).squareRoot()
-    }
-    let pluckTime = t.truncatingRemainder(dividingBy: 0.5)
-    value += sin(2 * .pi * 1760 * t) * 0.2 * exp(-pluckTime * 12)
-    for ch in 0..<channels {
-      output.append(ch == 0 ? value : value * 0.8 + sin(2 * .pi * 330 * t) * 0.05)
-    }
-  }
-  return output
-}
-
-// MARK: - AVFoundation Round-Trip Tests
-
-@Test func avAudioFileCanDecodeOutput() throws {
-  let mp3Data = makeTestMP3()
-  let url = try writeTempMP3(mp3Data)
-  defer { try? FileManager.default.removeItem(at: url) }
-
-  let (format, buffer) = try decodeMP3(at: url)
-
-  #expect(format.sampleRate == 44_100)
-  #expect(format.channelCount == 2)
-  #expect(buffer.frameLength > 0)
-}
-
-@Test func decodedSineWaveHasEnergy() throws {
-  let mp3Data = makeTestMP3(amplitude: 0.5, frameCount: 10)
-  let url = try writeTempMP3(mp3Data)
-  defer { try? FileManager.default.removeItem(at: url) }
-
-  let (_, buffer) = try decodeMP3(at: url)
-  let sampleCount = Int(buffer.frameLength)
-  let samples = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: sampleCount))
-
-  // A 0.5 amplitude sine should come back at about the same level.
-  #expect(peak(samples) > 0.45, "Decoded sine wave peak \(peak(samples)) is too low")
-  #expect(peak(samples) < 0.55, "Decoded sine wave peak \(peak(samples)) is too high")
-  #expect(rms(samples) > 0.2, "Decoded sine wave RMS \(rms(samples)) is too low")
-}
-
-@Test func decodedSilenceIsQuiet() throws {
-  let mp3Data = makeTestMP3(amplitude: 0, frameCount: 10)
-  let url = try writeTempMP3(mp3Data)
-  defer { try? FileManager.default.removeItem(at: url) }
-
-  let (_, buffer) = try decodeMP3(at: url)
-  let sampleCount = Int(buffer.frameLength)
-  let samples = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: sampleCount))
-
-  #expect(peak(samples) < 0.001, "Decoded silence peak \(peak(samples)) is too high — expected near-zero")
-}
-
-@Test func decodedDurationCoversInput() throws {
-  let frameCount = 20
-  let mp3Data = makeTestMP3(frameCount: frameCount)
-  let url = try writeTempMP3(mp3Data)
-  defer { try? FileManager.default.removeItem(at: url) }
-
-  let audioFile = try AVAudioFile(forReading: url)
-  let decodedFrames = Int(audioFile.length)
-
-  // All input plus the encoder delay, rounded up to whole frames.
-  let inputSamples = frameCount * 1152
-  #expect(decodedFrames >= inputSamples, "Decoded \(decodedFrames) samples, input was \(inputSamples)")
-  #expect(decodedFrames <= inputSamples + 3 * 1152, "Decoded \(decodedFrames) samples, input was \(inputSamples)")
-}
-
-@Test func sineRoundTripIsAccurate() throws {
-  var input = [Float]()
-  for i in 0..<(44_100 * 2) {
-    let value = sin(2 * .pi * 1000 * Float(i) / 44_100) * 0.5
-    input.append(value)
-    input.append(value)
-  }
-  let result = try roundTrip(input, channels: 2, options: MP3EncoderOptions(bitrateKbps: 128, mode: .jointStereo))
-  #expect(result.snr > 40, "SNR \(result.snr) dB")
-  #expect(abs(result.gain - 1) < 0.02, "Gain \(result.gain)")
-}
-
-@Test(arguments: [
-  (44_100, 128, MP3EncoderOptions.Mode.jointStereo, false),
-  (44_100, 128, .stereo, false),
-  (44_100, 96, .mono, false),
-  (48_000, 192, .jointStereo, false),
-  (32_000, 64, .jointStereo, false),
-  (44_100, 128, .jointStereo, true),
-])
-func musicRoundTripQuality(sampleRate: Int, bitrate: Int, mode: MP3EncoderOptions.Mode, vbr: Bool) throws {
-  let channels = mode == .mono ? 1 : 2
-  let input = musicLikeSignal(sampleRate: sampleRate, channels: channels)
-  let options = MP3EncoderOptions(sampleRate: sampleRate, bitrateKbps: bitrate, vbr: vbr, mode: mode)
-  let result = try roundTrip(input, channels: channels, options: options)
-  #expect(result.snr > 12, "SNR \(result.snr) dB")
-  #expect(abs(result.gain - 1) < 0.05, "Gain \(result.gain)")
-}
-
-@Test func multipleConfigurationsDecodeSuccessfully() throws {
-  let configs: [(sampleRate: Int, bitrate: Int, mode: MP3EncoderOptions.Mode, expectedChannels: UInt32)] = [
-    (44_100, 128, .stereo, 2),
-    (44_100, 128, .mono, 1),
-    (48_000, 192, .stereo, 2),
-    (32_000, 64, .stereo, 2),
-    (44_100, 128, .jointStereo, 2),
-  ]
-
-  for config in configs {
-    let mp3Data = makeTestMP3(
-      sampleRate: config.sampleRate,
-      bitrateKbps: config.bitrate,
-      mode: config.mode,
-      frameCount: 5
-    )
-    let url = try writeTempMP3(mp3Data)
-    defer { try? FileManager.default.removeItem(at: url) }
-
-    let (format, buffer) = try decodeMP3(at: url)
-
-    #expect(format.sampleRate == Double(config.sampleRate),
-      "\(config): sample rate mismatch")
-    #expect(format.channelCount == config.expectedChannels,
-      "\(config): channel count mismatch")
-    #expect(buffer.frameLength > 0,
-      "\(config): no decoded samples")
-  }
-}
-
-@Test func decodedMonoHasOneChannel() throws {
-  let mp3Data = makeTestMP3(mode: .mono, frameCount: 5)
-  let url = try writeTempMP3(mp3Data)
-  defer { try? FileManager.default.removeItem(at: url) }
-
-  let (format, buffer) = try decodeMP3(at: url)
-  #expect(format.channelCount == 1)
-
-  let sampleCount = Int(buffer.frameLength)
-  let samples = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: sampleCount))
-  #expect(peak(samples) > 0.45, "Decoded mono sine wave should have energy")
-}
-#endif
-
 // MARK: - Determinism and Invariant Tests
 
-@Test func encodingIsDeterministic() {
-  func encodeOnce() -> Data {
+@Test func encodingIsDeterministic() throws {
+  func encodeOnce() throws -> Data {
     let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-    let encoder = MP3Encoder(options: options)
+    let encoder = try MP3Encoder(options: options)
     var state = encoder.newSession()
 
     var data = Data()
@@ -928,16 +704,16 @@ func musicRoundTripQuality(sampleRate: Int, bitrate: Int, mode: MP3EncoderOption
     return data
   }
 
-  let first = encodeOnce()
-  let second = encodeOnce()
+  let first = try encodeOnce()
+  let second = try encodeOnce()
   #expect(first == second, "Same input should produce identical output (\(first.count) vs \(second.count) bytes)")
 }
 
-@Test func paddingRatioMatchesTheory() {
+@Test func paddingRatioMatchesTheory() throws {
   // At 128kbps/44.1kHz: remainder = (144 * 128 * 1000) % 44100 = 42300
   // Expected padded fraction = 42300 / 44100 ≈ 0.9592
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
-  let encoder = MP3Encoder(options: options)
+  let encoder = try MP3Encoder(options: options)
   var state = encoder.newSession()
 
   let total = 1000

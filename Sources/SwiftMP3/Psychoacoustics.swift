@@ -35,9 +35,10 @@ struct PsychoacousticModel {
   /// Multiplier applied to masking thresholds (from the quality setting).
   private let maskingScale: Float
 
-  init(sampleRate: Int, sampleRateIndex: Int, quality: Int) {
-    longBands = MPEG.longBands(sampleRateIndex: sampleRateIndex)
-    shortBands = MPEG.shortBands(sampleRateIndex: sampleRateIndex)
+  init(format: StreamFormat, quality: Int) {
+    longBands = format.longBands
+    shortBands = format.shortBands
+    let sampleRate = format.sampleRate
     // Quality 0 lowers thresholds by 4 dB, quality 9 raises them by 5 dB.
     maskingScale = Float(pow(10, Double(quality - 4) / 10))
 

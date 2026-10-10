@@ -2,17 +2,18 @@
 
 [![CI](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml/badge.svg)](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml)
 
-A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG-1 Layer III (MP3) entirely in Swift, on Apple platforms and Linux.
+A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG Layer III (MP3) entirely in Swift, on Apple platforms and Linux.
 
 ## Features
 
-- MPEG-1 Layer III encoding at 32kHz, 44.1kHz, and 48kHz sample rates
+- MPEG-1 Layer III at 32, 44.1, and 48 kHz, and MPEG-2/2.5 at 8 to 24 kHz for low-bitrate speech
 - CBR and VBR encoding modes, with a bit reservoir
 - Mono, stereo, and joint stereo
 - Streaming encoding â€” feed samples incrementally
 - Async/await support with `AsyncSequence` input
 - File encoding with automatic Xing header
-- Xing/Info header generation for accurate seeking
+- Xing/Info and LAME tags for accurate seeking and gapless playback
+- Float, 16-bit integer, planar, and `AVAudioPCMBuffer` input
 - Psychoacoustic model (spreading, tonality, absolute threshold of hearing, pre-echo control)
 - Noise-shaping quantization with scalefactors, pre-emphasis, and scalefactor sharing
 - Transient detection with long/short block switching
@@ -26,7 +27,7 @@ A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG-1 Layer 
 
 - Swift 5.10+
 - macOS 13+, iOS 16+, tvOS 16+, watchOS 9+, visionOS 1+, or Linux
-- Swift 6 toolchain (Xcode 16+) to run the tests (Swift Testing); the decode round-trip tests use AVFoundation and run on Apple platforms
+- Swift 6 toolchain (Xcode 16+) to run the tests (Swift Testing); the decode round-trip tests use AVFoundation on Apple platforms and ffmpeg on Linux
 
 ## Installation
 
@@ -60,7 +61,7 @@ Use `newSession()` to create a mutable encoding session for synchronous, increme
 ```swift
 import SwiftMP3
 
-let encoder = MP3Encoder(options: MP3EncoderOptions(
+let encoder = try MP3Encoder(options: MP3EncoderOptions(
   sampleRate: 44_100,
   bitrateKbps: 128,
   mode: .stereo
@@ -73,7 +74,7 @@ var mp3Data = session.encode(samples: pcmSamples)
 // Flush any remaining buffered samples
 mp3Data.append(session.flush())
 
-// Generate a Xing header for accurate seeking (prepend to file)
+// Generate the Info frame for seeking and gapless playback (prepend to file)
 let xingHeader = session.generateXingHeader()
 
 // Write the complete MP3 file
@@ -82,12 +83,30 @@ file.append(xingHeader)
 file.append(mp3Data)
 ```
 
+`MP3Encoder(options:)` throws an `MP3EncoderError` if the sample rate, bitrate, or quality isn't supported.
+
+### Other Input Formats
+
+Sessions also take 16-bit integer samples, one array per channel, or an `AVAudioPCMBuffer`:
+
+```swift
+var data = session.encode(samples: int16Samples)    // [Int16], interleaved
+data.append(session.encode(planar: [left, right]))  // [[Float]], one array per channel
+data.append(try session.encode(buffer: pcmBuffer))  // AVAudioPCMBuffer, float or int16
+```
+
+The buffer must match the encoder's sample rate and channel count; use `AVAudioConverter` to convert it first if it doesn't.
+
+### Gapless Playback
+
+The Info frame from `generateXingHeader()` (and from `encode(_:to:)`) carries a LAME tag with the encoder delay and padding. Players that read it, such as ffmpeg and mpg123, trim them, so the decoded audio has exactly as many samples as the input and loops or consecutive tracks play without a gap.
+
 ### Streaming Encode
 
 Use `encode(_:)` with any `AsyncSequence` of `[Float]` to get an `AsyncThrowingStream` of MP3 frame data:
 
 ```swift
-let encoder = MP3Encoder(options: options)
+let encoder = try MP3Encoder(options: options)
 
 for try await frame in encoder.encode(sampleSource) {
   // Each `frame` is a Data containing one or more MP3 frames
@@ -100,7 +119,7 @@ for try await frame in encoder.encode(sampleSource) {
 Use `encode(_:to:)` to write directly to a file, including the Xing header for seeking:
 
 ```swift
-let encoder = MP3Encoder(options: options)
+let encoder = try MP3Encoder(options: options)
 try await encoder.encode(sampleSource, to: outputURL)
 ```
 
@@ -112,7 +131,7 @@ Embed ID3v2.3 tags (title, artist, album, artwork, etc.) in your MP3 files:
 let options = MP3EncoderOptions(
   id3Tag: ID3Tag(title: "My Song", artist: "Artist", album: "Album")
 )
-let encoder = MP3Encoder(options: options)
+let encoder = try MP3Encoder(options: options)
 try await encoder.encode(source, to: url)
 ```
 
@@ -154,7 +173,7 @@ let source = AsyncStream<[Float]> { continuation in
 }
 
 try engine.start()
-let encoder = MP3Encoder(options: MP3EncoderOptions(mode: .mono))
+let encoder = try MP3Encoder(options: MP3EncoderOptions(sampleRate: Int(format.sampleRate), mode: .mono))
 try await encoder.encode(source, to: recordingURL)
 ```
 
@@ -163,7 +182,7 @@ try await encoder.encode(source, to: recordingURL)
 `MP3Encoder` is `Sendable`, so you can create it on the main actor and hand it off to a background task:
 
 ```swift
-let encoder = MP3Encoder(options: options)
+let encoder = try MP3Encoder(options: options)
 
 Task.detached {
   try await encoder.encode(sampleSource, to: outputURL)
@@ -175,7 +194,7 @@ Task.detached {
 Encode and send frames over a network connection:
 
 ```swift
-let encoder = MP3Encoder(options: options)
+let encoder = try MP3Encoder(options: options)
 
 for try await frame in encoder.encode(sampleSource) {
   try await connection.send(frame)
@@ -190,8 +209,8 @@ Configuration for the encoder.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
-| `sampleRate` | `Int` | `44_100` | Input sample rate (32000, 44100, or 48000) |
-| `bitrateKbps` | `Int` | `128` | Bitrate in kbps (32-320); the maximum average for VBR |
+| `sampleRate` | `Int` | `44_100` | Input sample rate; see [Sample Rates and Bitrates](#sample-rates-and-bitrates) |
+| `bitrateKbps` | `Int` | `128` | Bitrate in kbps; the maximum average for VBR |
 | `vbr` | `Bool` | `false` | Give each frame only the bits its masking threshold calls for |
 | `mode` | `Mode` | `.stereo` | Channel mode: `.mono`, `.stereo`, or `.jointStereo` |
 | `quality` | `Int` | `5` | Encoding quality 0 (best) to 9 (fastest) |
@@ -206,7 +225,7 @@ Stateless, `Sendable` encoder that holds configuration. Safe to share across tas
 
 | Method | Description |
 |---|---|
-| `init(options:)` | Create an encoder with the given options |
+| `init(options:) throws` | Create an encoder; throws `MP3EncoderError` for unsupported options |
 | `newSession() -> EncoderSession` | Create a mutable encoding session for synchronous use |
 | `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of sample buffers |
 | `encode(_:to:) async throws` | Encode an `AsyncSequence` directly to a file with Xing header (includes ID3 tag if set) |
@@ -218,11 +237,14 @@ Mutable encoding session created via `MP3Encoder.newSession()`. Not `Sendable` â
 | Method / Property | Description |
 |---|---|
 | `encode(samples: [Float]) -> Data` | Feed interleaved PCM samples, returns any complete MP3 frames |
+| `encode(samples: [Int16]) -> Data` | Feed interleaved 16-bit PCM samples |
+| `encode(planar: [[Float]]) -> Data` | Feed one array of samples per channel |
+| `encode(buffer: AVAudioPCMBuffer) throws -> Data` | Feed an audio buffer (Apple platforms) |
 | `flush() -> Data` | Pads and encodes any remaining buffered samples |
 | `generateID3Tag() -> Data` | Generates the ID3v2.3 tag data (empty if no tag configured) |
-| `generateXingHeader() -> Data` | Generates a Xing/Info header frame (call after encoding is complete) |
-| `encodedFrameCount: UInt32` | Number of MP3 frames encoded so far |
-| `encodedByteCount: UInt32` | Total bytes of encoded audio data so far |
+| `generateXingHeader() -> Data` | Generates the Xing/Info frame with a LAME tag (call after encoding is complete) |
+| `encodedFrameCount: Int` | Number of MP3 frames encoded so far |
+| `encodedByteCount: Int` | Total bytes of encoded audio data so far |
 
 ### `ID3Tag`
 
@@ -247,6 +269,16 @@ Input samples are interleaved `Float` values in the range `-1.0` to `1.0`:
 
 - **Mono**: `[s0, s1, s2, ...]`
 - **Stereo / Joint Stereo**: `[L0, R0, L1, R1, L2, R2, ...]`
+
+### Sample Rates and Bitrates
+
+The sample rate picks the MPEG version, which sets the bitrates available:
+
+| Version | Sample rates (Hz) | Bitrates (kbps) |
+|---|---|---|
+| MPEG-1 | 32000, 44100, 48000 | 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320 |
+| MPEG-2 | 16000, 22050, 24000 | 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 |
+| MPEG-2.5 | 8000, 11025, 12000 | 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 |
 
 ## Documentation
 
