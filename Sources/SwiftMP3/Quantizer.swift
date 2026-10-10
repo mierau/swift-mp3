@@ -6,6 +6,9 @@
 // allows (ISO/IEC 11172-3 Annex C.1.5.4), then selects Huffman tables.
 
 import Foundation
+#if canImport(Accelerate)
+import Accelerate
+#endif
 
 /// Side information and quantized values for one granule of one channel.
 struct GranuleInfo {
@@ -127,8 +130,8 @@ struct Quantizer {
   /// Whether to search for the best big-values region split.
   private let searchRegions: Bool
 
-  /// |x|^(3/4), then |x|, for the granule being quantized.
-  private var floats = [Float](repeating: 0, count: 576 * 2)
+  /// |x|^(3/4), then |x|, for the granule being quantized, then vector scratch.
+  private var floats = [Float](repeating: 0, count: 576 * 6)
   private var ix = [Int32](repeating: 0, count: 576)
 
   /// `floor(v)` for `0 <= v < 2^22`, without the range checks of `Int32(_:)`.
@@ -173,6 +176,7 @@ struct Quantizer {
         var work = GranuleQuantization(
           xr34: floats.baseAddress!,
           absXR: floats.baseAddress! + 576,
+          scratch: floats.baseAddress! + 1152,
           ix: ix.baseAddress!,
           layout: layout,
           regions: regions,
@@ -208,6 +212,7 @@ extension Quantizer {
         var work = GranuleQuantization(
           xr34: floats.baseAddress!,
           absXR: floats.baseAddress! + 576,
+          scratch: floats.baseAddress! + 1152,
           ix: ix.baseAddress!,
           layout: layout,
           regions: regions,
@@ -224,6 +229,8 @@ extension Quantizer {
 private struct GranuleQuantization {
   let xr34: UnsafeMutablePointer<Float>
   let absXR: UnsafeMutablePointer<Float>
+  /// Four 576-line scratch vectors.
+  let scratch: UnsafeMutablePointer<Float>
   let ix: UnsafeMutablePointer<Int32>
   let layout: BandLayout
   let regions: RegionLayout
@@ -236,10 +243,14 @@ private struct GranuleQuantization {
   var noise: [Float]
   /// Lines past this index are zero.
   var lastLine = 0
+  /// Per band, the lowest step exponent that keeps its peak below
+  /// ``Quantizer/maxQuantized``, or `Int.min` for a silent band.
+  var peakExponent: [Int] = []
 
   init(
     xr34: UnsafeMutablePointer<Float>,
     absXR: UnsafeMutablePointer<Float>,
+    scratch: UnsafeMutablePointer<Float>,
     ix: UnsafeMutablePointer<Int32>,
     layout: BandLayout,
     regions: RegionLayout,
@@ -248,6 +259,7 @@ private struct GranuleQuantization {
   ) {
     self.xr34 = xr34
     self.absXR = absXR
+    self.scratch = scratch
     self.ix = ix
     self.layout = layout
     self.regions = regions
@@ -286,6 +298,7 @@ private struct GranuleQuantization {
       return info
     }
 
+    findPeakExponents()
     info.globalGain = minimumGain(info)
     searchGain(&info, budget: budget, from: info.globalGain, coarse: true)
 
@@ -379,10 +392,14 @@ private struct GranuleQuantization {
         energy += absXR[i] * absXR[i]
       }
       guard m > 1e-9, energy > allowedNoise[band] else { continue }
-      let lowest = Int((log2(m / 8206) / 0.1875).rounded(.up)) + 1
-      floor[band] = lowest
-      var low = lowest
-      var high = lowest + 256
+      floor[band] = Int((log2(m / 8206) / 0.1875).rounded(.up)) + 1
+    }
+    #if canImport(Accelerate)
+    searchRequired(floor, into: &required)
+    #else
+    for band in 0..<layout.count where floor[band] != Int.min {
+      var low = floor[band]
+      var high = low + 256
       if bandNoise(band, exponent: low) > allowedNoise[band] {
         required[band] = low
         continue
@@ -393,6 +410,7 @@ private struct GranuleQuantization {
       }
       required[band] = low
     }
+    #endif
 
     var best: GranuleInfo?
     var bestBits = Int.max
@@ -451,6 +469,88 @@ private struct GranuleQuantization {
     return sum
   }
 
+  #if canImport(Accelerate)
+  /// The bisection of ``runTransparent(spectrum:blockType:searchRegions:)`` for all bands
+  /// at once: each round measures every unfinished band's noise in one vector pass.
+  private func searchRequired(_ floor: [Int], into required: inout [Int?]) {
+    var low = floor
+    var high = floor.map { $0 &+ 256 }
+    var probe = floor
+    var active = floor.map { $0 != Int.min }
+    var measured = [Float](repeating: 0, count: layout.count)
+    var first = true
+    while active.contains(true) {
+      if !first {
+        for band in 0..<layout.count where active[band] { probe[band] = (low[band] + high[band]) / 2 }
+      }
+      bandNoises(exponents: probe, active: active, into: &measured)
+      for band in 0..<layout.count where active[band] {
+        if first {
+          if measured[band] > allowedNoise[band] {
+            required[band] = low[band]
+            active[band] = false
+          }
+        } else if measured[band] <= allowedNoise[band] {
+          low[band] = probe[band]
+        } else {
+          high[band] = probe[band]
+        }
+        if active[band] && high[band] - low[band] <= 1 {
+          required[band] = low[band]
+          active[band] = false
+        }
+      }
+      first = false
+    }
+  }
+
+  /// ``bandNoise(_:exponent:)`` for every active band, with identical results.
+  private func bandNoises(exponents: [Int], active: [Bool], into noise: inout [Float]) {
+    let inverse = scratch
+    let scale = scratch + 576
+    let v = scratch + 1152
+    let f = scratch + 1728
+    var n = 0
+    for band in 0..<layout.count {
+      let start = layout.start[band]
+      let width = vDSP_Length(layout.end[band] - start)
+      var i: Float = 0
+      var s: Float = 0
+      if active[band] {
+        i = tables.inverseStep(exponents[band])
+        s = tables.step(exponents[band])
+        n = layout.end[band]
+      }
+      vDSP_vfill(&i, inverse + start, 1, width)
+      vDSP_vfill(&s, scale + start, 1, width)
+    }
+    let count = vDSP_Length(n)
+    var limit: Float = 8206
+    var zero: Float = 0
+    var half: Float = 0.5
+    vDSP_vmul(xr34, 1, inverse, 1, v, 1, count)
+    vDSP_vclip(v, 1, &zero, &limit, v, 1, count)
+    // q = floor(v), plus one where the remainder reaches the rounding threshold.
+    vDSP_vfrac(v, 1, f, 1, count)
+    vDSP_vsub(f, 1, v, 1, v, 1, count)
+    vDSP_vindex(tables.roundingThreshold, v, 1, inverse, 1, count)
+    vDSP_vsub(inverse, 1, f, 1, f, 1, count)
+    vDSP_vlim(f, 1, &zero, &half, f, 1, count)
+    vDSP_vsadd(f, 1, &half, f, 1, count)
+    vDSP_vadd(f, 1, v, 1, v, 1, count)
+    // d = |x| - q^(4/3) · step, then d² summed in line order per band.
+    vDSP_vindex(tables.pow43, v, 1, f, 1, count)
+    vDSP_vmul(f, 1, scale, 1, f, 1, count)
+    vDSP_vsub(f, 1, absXR, 1, f, 1, count)
+    vDSP_vsq(f, 1, f, 1, count)
+    for band in 0..<layout.count where active[band] {
+      var sum: Float = 0
+      for i in layout.start[band]..<layout.end[band] { sum += f[i] }
+      noise[band] = sum
+    }
+  }
+  #endif
+
   // MARK: - Gain search
 
   /// Quantizer step exponent for a band, in units of 2^(1/4).
@@ -461,18 +561,24 @@ private struct GranuleQuantization {
     return info.globalGain - 210 - shift * (info.scalefactors[band] + pre)
   }
 
+  /// Fills ``peakExponent`` from `xr34`.
+  mutating func findPeakExponents() {
+    peakExponent = (0..<layout.count).map { band in
+      var m: Float = 0
+      for i in layout.start[band]..<layout.end[band] { m = max(m, xr34[i]) }
+      guard m > 1e-9 else { return Int.min }
+      // m * 2^(-3/16 · e) must stay below 8206 after rounding.
+      return Int((log2(m / 8206) / 0.1875).rounded(.up)) + 1
+    }
+  }
+
   /// Lowest global gain at which no value exceeds ``Quantizer/maxQuantized``.
   func minimumGain(_ info: GranuleInfo) -> Int {
     var gain = 0
     var probe = info
     probe.globalGain = 210
-    for band in 0..<layout.count {
-      var m: Float = 0
-      for i in layout.start[band]..<layout.end[band] { m = max(m, xr34[i]) }
-      guard m > 1e-9 else { continue }
-      // m * 2^(-3/16 · e) must stay below 8206 after rounding.
-      let needed = Int((log2(m / 8206) / 0.1875).rounded(.up)) + 1
-      gain = max(gain, needed - stepExponent(probe, band: band) + 210)
+    for band in 0..<layout.count where peakExponent[band] != Int.min {
+      gain = max(gain, peakExponent[band] - stepExponent(probe, band: band) + 210)
     }
     return min(max(gain, 0), 255)
   }
@@ -519,6 +625,9 @@ private struct GranuleQuantization {
   /// Quantizes all bands into `ix`. Returns `false` if any value overflows.
   @discardableResult
   func quantizeAll(_ info: GranuleInfo) -> Bool {
+    #if canImport(Accelerate)
+    if quantizeAllVector(info) { return true }
+    #endif
     var ok = true
     let threshold = tables.roundingThreshold
     for band in 0..<layout.count {
@@ -543,6 +652,47 @@ private struct GranuleQuantization {
     }
     return ok
   }
+
+  #if canImport(Accelerate)
+  /// ``quantizeAll(_:)`` with vDSP, producing identical values. Returns `false`, leaving
+  /// `ix` unspecified, if any value overflows.
+  private func quantizeAllVector(_ info: GranuleInfo) -> Bool {
+    let steps = scratch
+    let v = scratch + 576
+    let f = scratch + 1152
+    let t = scratch + 1728
+    // Lines up to the end of the band holding `lastLine`; the rest quantize to zero.
+    var n = 0
+    for band in 0..<layout.count {
+      let start = layout.start[band]
+      guard start < lastLine else { break }
+      var step = tables.inverseStep(stepExponent(info, band: band))
+      n = layout.end[band]
+      vDSP_vfill(&step, steps + start, 1, vDSP_Length(n - start))
+    }
+    let count = vDSP_Length(n)
+    if n > 0 {
+      vDSP_vmul(xr34, 1, steps, 1, v, 1, count)
+      var peak: Float = 0
+      vDSP_maxv(v, 1, &peak, count)
+      guard peak < 8206 else { return false }
+      // q = floor(v), plus one where the remainder reaches the rounding threshold.
+      vDSP_vfix32(v, 1, ix, 1, count)
+      vDSP_vflt32(ix, 1, f, 1, count)
+      vDSP_vindex(tables.roundingThreshold, f, 1, t, 1, count)
+      vDSP_vsub(f, 1, v, 1, v, 1, count)
+      vDSP_vsub(t, 1, v, 1, v, 1, count)
+      var zero: Float = 0
+      var half: Float = 0.5
+      vDSP_vlim(v, 1, &zero, &half, v, 1, count)
+      vDSP_vsadd(v, 1, &half, v, 1, count)
+      vDSP_vadd(f, 1, v, 1, v, 1, count)
+      vDSP_vfix32(v, 1, ix, 1, count)
+    }
+    (ix + n).update(repeating: 0, count: 576 - n)
+    return true
+  }
+  #endif
 
   // MARK: - Distortion
 

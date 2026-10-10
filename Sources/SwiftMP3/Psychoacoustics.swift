@@ -7,6 +7,9 @@
 // below by the absolute threshold of hearing.
 
 import Foundation
+#if canImport(Accelerate)
+import Accelerate
+#endif
 
 /// Allowed noise and perceptual entropy for one granule of one channel.
 struct MaskingResult {
@@ -107,8 +110,9 @@ struct PsychoacousticModel {
     let count = longBands.count - 1
     var energy = [Float](repeating: 0, count: count)
     var tonalOffset = [Float](repeating: 0, count: count)
+    let logs = Self.lineLogEnergies(spectrum)
     for b in 0..<count {
-      let (e, offset) = bandStatistics(spectrum, from: longBands[b], to: longBands[b + 1], bark: longBark[b])
+      let (e, offset) = bandStatistics(spectrum, logs: logs, from: longBands[b], to: longBands[b + 1], bark: longBark[b])
       energy[b] = e
       tonalOffset[b] = offset
     }
@@ -135,11 +139,12 @@ struct PsychoacousticModel {
     var pe: Float = 0
     var windowEnergy = [Float](repeating: 0, count: count)
     var tonalOffset = [Float](repeating: 0, count: count)
+    let logs = Self.lineLogEnergies(spectrum)
     for w in 0..<3 {
       for b in 0..<count {
         let width = shortBands[b + 1] - shortBands[b]
         let start = shortBands[b] * 3 + w * width
-        let (e, offset) = bandStatistics(spectrum, from: start, to: start + width, bark: shortBark[b])
+        let (e, offset) = bandStatistics(spectrum, logs: logs, from: start, to: start + width, bark: shortBark[b])
         windowEnergy[b] = e
         tonalOffset[b] = offset
       }
@@ -161,13 +166,20 @@ struct PsychoacousticModel {
   /// The offset is the signal-to-mask ratio for a masker of this band: 6 dB
   /// for noise and 14.5 + Bark dB (at least 29 dB) for a pure tone, interpolated by spectral flatness.
   @inline(__always)
-  private func bandStatistics(_ x: UnsafePointer<Float>, from start: Int, to end: Int, bark: Float) -> (Float, Float) {
+  private func bandStatistics(_ x: UnsafePointer<Float>, logs: [Float], from start: Int, to end: Int, bark: Float) -> (Float, Float) {
     var sum: Float = 0
     var logSum: Float = 0
-    for i in start..<end {
-      let e = x[i] * x[i]
-      sum += e
-      logSum += log2(e + 1e-30)
+    if logs.isEmpty {
+      for i in start..<end {
+        let e = x[i] * x[i]
+        sum += e
+        logSum += log2(e + 1e-30)
+      }
+    } else {
+      for i in start..<end {
+        sum += x[i] * x[i]
+        logSum += logs[i]
+      }
     }
     let n = Float(end - start)
     guard sum > 1e-24 else { return (sum, 1) }
@@ -176,6 +188,25 @@ struct PsychoacousticModel {
     let tonality = min(max(flatness / -6, 0), 1)
     let offsetDB = tonality * max(29, 14.5 + bark) + (1 - tonality) * 6
     return (sum, pow(10, -offsetDB / 10))
+  }
+
+  /// log2(x² + 1e-30) for all 576 lines, or an empty array where the scalar loop in
+  /// ``bandStatistics(_:logs:from:to:bark:)`` computes it instead.
+  private static func lineLogEnergies(_ x: UnsafePointer<Float>) -> [Float] {
+    #if canImport(Accelerate)
+    var logs = [Float](repeating: 0, count: MPEG.samplesPerGranule)
+    logs.withUnsafeMutableBufferPointer { logs in
+      let n = vDSP_Length(MPEG.samplesPerGranule)
+      var floor: Float = 1e-30
+      vDSP_vsq(x, 1, logs.baseAddress!, 1, n)
+      vDSP_vsadd(logs.baseAddress!, 1, &floor, logs.baseAddress!, 1, n)
+      var count = Int32(MPEG.samplesPerGranule)
+      vvlog2f(logs.baseAddress!, logs.baseAddress!, &count)
+    }
+    return logs
+    #else
+    return []
+    #endif
   }
 
   /// Spreads each band's energy, attenuated by its masking offset, across neighboring bands.
