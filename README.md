@@ -1,8 +1,6 @@
 # SwiftMP3
 
 [![CI](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml/badge.svg)](https://github.com/mierau/swift-mp3/actions/workflows/ci.yml)
-[![Swift Versions](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fmierau%2Fswift-mp3%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/mierau/swift-mp3)
-[![Platforms](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fmierau%2Fswift-mp3%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/mierau/swift-mp3)
 
 A pure Swift MP3 encoder with no external dependencies beyond Apple's Accelerate framework. Encode PCM audio to MPEG-1 Layer III (MP3) entirely in Swift.
 
@@ -250,7 +248,7 @@ Input samples are interleaved `Float` values in the range `-1.0` to `1.0`:
 
 ## Documentation
 
-API documentation is available on the [Swift Package Index](https://swiftpackageindex.com/mierau/swift-mp3/documentation/swiftmp3), or can be built locally in Xcode with **Product › Build Documentation**.
+API documentation can be built locally in Xcode with **Product › Build Documentation**.
 
 ## Development
 
