@@ -1,8 +1,9 @@
 import Foundation
 import Testing
-import AVFoundation
-import Accelerate
 @testable import SwiftMP3
+#if canImport(AVFoundation)
+import AVFoundation
+#endif
 
 @Test func encodeSilence() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
@@ -403,36 +404,35 @@ import Accelerate
   #expect(has418, "Should have 418-byte frames (with padding)")
 }
 
-// MARK: - One-Frame Delay Tests
+// MARK: - Latency Tests
 
-@Test func oneFrameDelayFirstEncodeReturnsEmpty() {
+@Test func firstEncodeIsBufferedUntilEnoughInput() {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
   let encoder = MP3Encoder(options: options)
   var state = encoder.newSession()
 
-  // The very first full frame should return empty (buffered, not emitted)
+  // The filterbank, MDCT overlap, and block-switching lookahead delay output by about a frame.
   let samples = [Float](repeating: 0, count: 1152 * 2)
-  let firstResult = state.encode(samples: samples)
-  #expect(firstResult.isEmpty, "First encode should return empty due to one-frame buffering")
+  #expect(state.encode(samples: samples).isEmpty)
 
-  // The second full frame should emit the first frame
-  let secondResult = state.encode(samples: samples)
-  #expect(secondResult.count > 0, "Second encode should emit the first buffered frame")
-  #expect(secondResult[0] == 0xFF)
-  #expect(secondResult[1] & 0xE0 == 0xE0)
+  var output = Data()
+  for _ in 0..<3 {
+    output.append(state.encode(samples: samples))
+  }
+  #expect(output.count > 0)
+  #expect(output[0] == 0xFF)
+  #expect(output[1] & 0xE0 == 0xE0)
 }
 
-@Test func flushEmitsBufferedFrameWithEmptyPCM() {
+@Test func flushEmitsBufferedFrames() {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
   let encoder = MP3Encoder(options: options)
   var state = encoder.newSession()
 
-  // Feed exactly one full frame — pcmBuffer will be empty but frame is buffered
   let samples = [Float](repeating: 0, count: 1152 * 2)
   let encoded = state.encode(samples: samples)
   #expect(encoded.isEmpty)
 
-  // flush() should emit the buffered frame even though pcmBuffer is empty
   let flushed = state.flush()
   #expect(flushed.count > 0)
   #expect(flushed[0] == 0xFF)
@@ -467,65 +467,52 @@ import Accelerate
   }
   totalOutput.append(state.flush())
 
-  #expect(state.encodedFrameCount == UInt32(frameTarget))
+  // One extra frame carries the tail delayed by the filterbank.
+  #expect(state.encodedFrameCount == UInt32(frameTarget + 1))
   #expect(state.encodedByteCount == UInt32(totalOutput.count))
 
   // At 128kbps/44.1kHz, each frame is 417 or 418 bytes
-  let averageFrameSize = Double(totalOutput.count) / Double(frameTarget)
+  let averageFrameSize = Double(totalOutput.count) / Double(frameTarget + 1)
   #expect(averageFrameSize >= 417.0 && averageFrameSize <= 418.0,
     "Average frame size should be ~417-418 bytes, got \(averageFrameSize)")
 }
 
-@Test func finalFrameHasZeroMainDataBegin() {
+@Test func mainDataBeginStaysWithinEarlierFrames() {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
   let encoder = MP3Encoder(options: options)
   var state = encoder.newSession()
 
-  // Encode several frames of a sine wave to build reservoir state
-  for frameIdx in 0..<6 {
+  // A quiet sine followed by a loud chirp fills the reservoir, then drains it.
+  var output = Data()
+  for frameIdx in 0..<12 {
     var samples = [Float]()
     for i in 0..<1152 {
       let t = Float(frameIdx * 1152 + i) / 44_100.0
-      let value = sin(2.0 * .pi * 440.0 * t) * 0.3
+      let value = frameIdx < 6 ? sin(2.0 * .pi * 440.0 * t) * 0.05 : sin(2.0 * .pi * 3000.0 * t * t) * 0.8
       samples.append(value)
-      samples.append(value)
+      samples.append(-value)
     }
-    _ = state.encode(samples: samples)
+    output.append(state.encode(samples: samples))
   }
+  output.append(state.flush())
 
-  // flush() produces the last frame — feed partial samples to trigger isFinal path
-  let partial = [Float](repeating: 0.1, count: 500)
-  _ = state.encode(samples: partial)
-  let flushed = state.flush()
-
-  // The very last frame in the flushed data should have main_data_begin = 0
-  // Find the last frame by scanning
-  let bytes = [UInt8](flushed)
-  var lastFrameOffset = -1
+  let bytes = [UInt8](output)
+  let bitrateTable = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
   var offset = 0
-  while offset + 4 < bytes.count {
-    if bytes[offset] == 0xFF && (bytes[offset + 1] & 0xE0) == 0xE0 {
-      lastFrameOffset = offset
-      // Advance by frame size
-      let bitrateIndex = (Int(bytes[offset + 2]) >> 4) & 0x0F
-      let sampleRateIndex = (Int(bytes[offset + 2]) >> 2) & 0x03
-      let paddingBit = (Int(bytes[offset + 2]) >> 1) & 0x01
-      let bitrateTable = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
-      let sampleRateTable = [44100, 48000, 32000, 0]
-      let bv = bitrateTable[bitrateIndex]
-      let sr = sampleRateTable[sampleRateIndex]
-      guard bv > 0 && sr > 0 else { break }
-      offset += (144 * bv * 1000) / sr + paddingBit
-    } else {
-      offset += 1
-    }
+  var available = 0
+  var frames = 0
+  while offset + 6 <= bytes.count {
+    #expect(bytes[offset] == 0xFF && bytes[offset + 1] & 0xE0 == 0xE0)
+    let bitrate = bitrateTable[Int(bytes[offset + 2]) >> 4]
+    let size = 144_000 * bitrate / 44_100 + (Int(bytes[offset + 2]) >> 1) & 0x01
+    let mainDataBegin = (Int(bytes[offset + 4]) << 1) | (Int(bytes[offset + 5]) >> 7)
+    #expect(mainDataBegin <= available, "Frame \(frames) points \(mainDataBegin) bytes back, only \(available) available")
+    available = min(available + size - 4 - 32, 511)
+    offset += size
+    frames += 1
   }
-
-  #expect(lastFrameOffset >= 0, "Should find at least one frame")
-  if lastFrameOffset >= 0 && lastFrameOffset + 5 < bytes.count {
-    let mainDataBegin = (Int(bytes[lastFrameOffset + 4]) << 1) | (Int(bytes[lastFrameOffset + 5]) >> 7)
-    #expect(mainDataBegin == 0, "Final frame should have main_data_begin = 0, got \(mainDataBegin)")
-  }
+  #expect(offset == bytes.count)
+  #expect(frames == 13)
 }
 
 @Test func monoReservoirWorks() async throws {
@@ -546,7 +533,7 @@ import Accelerate
   allData.append(state.flush())
 
   #expect(allData.count > 0)
-  #expect(state.encodedFrameCount == 8)
+  #expect(state.encodedFrameCount == 9)
 
   // Verify frames are valid
   #expect(allData[0] == 0xFF)
@@ -604,7 +591,7 @@ import Accelerate
 
   // All bytes should be consumed (no trailing garbage)
   #expect(offset == bytes.count, "Output has \(bytes.count - offset) trailing bytes after \(parsedFrames) frames")
-  #expect(parsedFrames == 20, "Expected 20 frames, parsed \(parsedFrames)")
+  #expect(parsedFrames == 21, "Expected 21 frames, parsed \(parsedFrames)")
 }
 
 // MARK: - Helpers
@@ -641,6 +628,63 @@ private func makeTestMP3(
   return xingHeader + mp3Frames
 }
 
+/// Walks the frames of an MP3 stream and returns each frame's bitrate in kbps.
+private func frameBitrates(_ data: Data) -> [Int] {
+  let bytes = [UInt8](data)
+  let bitrateTable = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
+  let sampleRateTable = [44100, 48000, 32000, 0]
+  var result = [Int]()
+  var offset = 0
+  while offset + 4 <= bytes.count, bytes[offset] == 0xFF, bytes[offset + 1] & 0xE0 == 0xE0 {
+    let bitrate = bitrateTable[Int(bytes[offset + 2]) >> 4]
+    let sampleRate = sampleRateTable[(Int(bytes[offset + 2]) >> 2) & 0x03]
+    guard bitrate > 0, sampleRate > 0 else { break }
+    result.append(bitrate)
+    offset += 144_000 * bitrate / sampleRate + (Int(bytes[offset + 2]) >> 1) & 0x01
+  }
+  return offset == bytes.count ? result : []
+}
+
+@Test func vbrSpendsFewerBitsOnSimpleSignals() {
+  func encode(vbr: Bool) -> Data {
+    let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 192, vbr: vbr, mode: .jointStereo)
+    var state = MP3Encoder(options: options).newSession()
+    var samples = [Float]()
+    for i in 0..<(44_100 * 2) {
+      let value = sin(2 * .pi * 440 * Float(i) / 44_100) * 0.5
+      samples.append(value)
+      samples.append(value)
+    }
+    var data = state.encode(samples: samples)
+    data.append(state.flush())
+    return data
+  }
+  let cbr = encode(vbr: false)
+  let vbr = encode(vbr: true)
+  let bitrates = frameBitrates(vbr)
+  #expect(!bitrates.isEmpty, "VBR output should be a contiguous run of valid frames")
+  #expect(Set(bitrates).count > 1 || bitrates.first.map { $0 < 192 } == true)
+  #expect(vbr.count * 2 < cbr.count, "VBR \(vbr.count) bytes vs CBR \(cbr.count) bytes")
+}
+
+@Test func vbrAverageStaysAtOrBelowTarget() {
+  let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, vbr: true, mode: .jointStereo)
+  var state = MP3Encoder(options: options).newSession()
+  // Uncorrelated noise needs every bit it can get.
+  var generator = SystemRandomNumberGenerator()
+  var data = Data()
+  for _ in 0..<100 {
+    let samples = (0..<(1152 * 2)).map { _ in Float.random(in: -0.5...0.5, using: &generator) }
+    data.append(state.encode(samples: samples))
+  }
+  data.append(state.flush())
+  let bitrates = frameBitrates(data)
+  #expect(bitrates.count == 101)
+  let average = Double(bitrates.reduce(0, +)) / Double(max(bitrates.count, 1))
+  #expect(average <= 128 * 1.1, "Average bitrate \(average) kbps")
+}
+
+#if canImport(AVFoundation)
 /// Writes data to a temp .mp3 file and returns the URL.
 private func writeTempMP3(_ data: Data) throws -> URL {
   let url = FileManager.default.temporaryDirectory
@@ -657,6 +701,79 @@ private func decodeMP3(at url: URL) throws -> (format: AVAudioFormat, buffer: AV
   let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
   try audioFile.read(into: buffer)
   return (format, buffer)
+}
+
+private func peak(_ samples: [Float]) -> Float {
+  samples.reduce(0) { max($0, abs($1)) }
+}
+
+private func rms(_ samples: [Float]) -> Float {
+  (samples.reduce(0) { $0 + $1 * $1 } / Float(max(samples.count, 1))).squareRoot()
+}
+
+/// Encodes `input` (interleaved), decodes it, aligns the result, and returns the
+/// signal-to-noise ratio in dB and the output/input level ratio of the first channel.
+private func roundTrip(
+  _ input: [Float],
+  channels: Int,
+  options: MP3EncoderOptions
+) throws -> (snr: Double, gain: Double) {
+  var state = MP3Encoder(options: options).newSession()
+  var data = state.encode(samples: input)
+  data.append(state.flush())
+  let url = try writeTempMP3(state.generateXingHeader() + data)
+  defer { try? FileManager.default.removeItem(at: url) }
+  let (_, buffer) = try decodeMP3(at: url)
+  let decoded = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength)))
+  let reference = stride(from: 0, to: input.count, by: channels).map { input[$0] }
+
+  // Find the decoder delay by cross-correlating a window from the middle.
+  let window = Array(reference[8192..<16384])
+  var bestLag = 0
+  var bestScore = -Double.infinity
+  for lag in 0..<4096 where 8192 + lag + window.count <= decoded.count {
+    var score = 0.0
+    for i in Swift.stride(from: 0, to: window.count, by: 4) {
+      score += Double(window[i]) * Double(decoded[8192 + lag + i])
+    }
+    if score > bestScore {
+      bestScore = score
+      bestLag = lag
+    }
+  }
+  var signal = 0.0
+  var noise = 0.0
+  var output = 0.0
+  for i in 4096..<(reference.count - 4096) where i + bestLag < decoded.count {
+    let a = Double(reference[i])
+    let b = Double(decoded[i + bestLag])
+    signal += a * a
+    noise += (a - b) * (a - b)
+    output += b * b
+  }
+  return (10 * log10(signal / max(noise, 1e-20)), (output / max(signal, 1e-20)).squareRoot())
+}
+
+/// A few seconds of a chord with vibrato and a decaying pluck, which exercises tonal
+/// masking, block switching, and the bit reservoir.
+private func musicLikeSignal(sampleRate: Int, channels: Int, seconds: Double = 3) -> [Float] {
+  let count = Int(Double(sampleRate) * seconds)
+  var output = [Float]()
+  output.reserveCapacity(count * channels)
+  let notes: [Float] = [220, 277.18, 329.63, 440, 659.25]
+  for i in 0..<count {
+    let t = Float(i) / Float(sampleRate)
+    var value: Float = 0
+    for (k, f) in notes.enumerated() {
+      value += sin(2 * .pi * f * t + 0.3 * sin(2 * .pi * 5 * t)) * 0.08 / Float(k + 1).squareRoot()
+    }
+    let pluckTime = t.truncatingRemainder(dividingBy: 0.5)
+    value += sin(2 * .pi * 1760 * t) * 0.2 * exp(-pluckTime * 12)
+    for ch in 0..<channels {
+      output.append(ch == 0 ? value : value * 0.8 + sin(2 * .pi * 330 * t) * 0.05)
+    }
+  }
+  return output
 }
 
 // MARK: - AVFoundation Round-Trip Tests
@@ -682,15 +799,10 @@ private func decodeMP3(at url: URL) throws -> (format: AVAudioFormat, buffer: AV
   let sampleCount = Int(buffer.frameLength)
   let samples = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: sampleCount))
 
-  // Check peak amplitude — lossy compression, but 0.5 input should survive as > 0.05
-  var peak: Float = 0
-  vDSP_maxv(samples.map { abs($0) }, 1, &peak, vDSP_Length(sampleCount))
-  #expect(peak > 0.05, "Decoded sine wave peak \(peak) is too low")
-
-  // Check RMS energy
-  var rms: Float = 0
-  vDSP_rmsqv(samples, 1, &rms, vDSP_Length(sampleCount))
-  #expect(rms > 0.01, "Decoded sine wave RMS \(rms) is too low")
+  // A 0.5 amplitude sine should come back at about the same level.
+  #expect(peak(samples) > 0.45, "Decoded sine wave peak \(peak(samples)) is too low")
+  #expect(peak(samples) < 0.55, "Decoded sine wave peak \(peak(samples)) is too high")
+  #expect(rms(samples) > 0.2, "Decoded sine wave RMS \(rms(samples)) is too low")
 }
 
 @Test func decodedSilenceIsQuiet() throws {
@@ -702,12 +814,10 @@ private func decodeMP3(at url: URL) throws -> (format: AVAudioFormat, buffer: AV
   let sampleCount = Int(buffer.frameLength)
   let samples = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: sampleCount))
 
-  var peak: Float = 0
-  vDSP_maxv(samples.map { abs($0) }, 1, &peak, vDSP_Length(sampleCount))
-  #expect(peak < 0.05, "Decoded silence peak \(peak) is too high — expected near-zero")
+  #expect(peak(samples) < 0.001, "Decoded silence peak \(peak(samples)) is too high — expected near-zero")
 }
 
-@Test func decodedDurationIsCorrect() throws {
+@Test func decodedDurationCoversInput() throws {
   let frameCount = 20
   let mp3Data = makeTestMP3(frameCount: frameCount)
   let url = try writeTempMP3(mp3Data)
@@ -716,12 +826,39 @@ private func decodeMP3(at url: URL) throws -> (format: AVAudioFormat, buffer: AV
   let audioFile = try AVAudioFile(forReading: url)
   let decodedFrames = Int(audioFile.length)
 
-  // Expected: frameCount * 1152 samples, plus Xing header frame (1152 silent samples).
-  // Allow tolerance for encoder/decoder delay (~1200 samples each direction).
-  let expectedSamples = (frameCount + 1) * 1152
-  let tolerance = 2400
-  #expect(abs(decodedFrames - expectedSamples) < tolerance,
-    "Decoded \(decodedFrames) samples, expected ~\(expectedSamples) ± \(tolerance)")
+  // All input plus the encoder delay, rounded up to whole frames.
+  let inputSamples = frameCount * 1152
+  #expect(decodedFrames >= inputSamples, "Decoded \(decodedFrames) samples, input was \(inputSamples)")
+  #expect(decodedFrames <= inputSamples + 3 * 1152, "Decoded \(decodedFrames) samples, input was \(inputSamples)")
+}
+
+@Test func sineRoundTripIsAccurate() throws {
+  var input = [Float]()
+  for i in 0..<(44_100 * 2) {
+    let value = sin(2 * .pi * 1000 * Float(i) / 44_100) * 0.5
+    input.append(value)
+    input.append(value)
+  }
+  let result = try roundTrip(input, channels: 2, options: MP3EncoderOptions(bitrateKbps: 128, mode: .jointStereo))
+  #expect(result.snr > 40, "SNR \(result.snr) dB")
+  #expect(abs(result.gain - 1) < 0.02, "Gain \(result.gain)")
+}
+
+@Test(arguments: [
+  (44_100, 128, MP3EncoderOptions.Mode.jointStereo, false),
+  (44_100, 128, .stereo, false),
+  (44_100, 96, .mono, false),
+  (48_000, 192, .jointStereo, false),
+  (32_000, 64, .jointStereo, false),
+  (44_100, 128, .jointStereo, true),
+])
+func musicRoundTripQuality(sampleRate: Int, bitrate: Int, mode: MP3EncoderOptions.Mode, vbr: Bool) throws {
+  let channels = mode == .mono ? 1 : 2
+  let input = musicLikeSignal(sampleRate: sampleRate, channels: channels)
+  let options = MP3EncoderOptions(sampleRate: sampleRate, bitrateKbps: bitrate, vbr: vbr, mode: mode)
+  let result = try roundTrip(input, channels: channels, options: options)
+  #expect(result.snr > 12, "SNR \(result.snr) dB")
+  #expect(abs(result.gain - 1) < 0.05, "Gain \(result.gain)")
 }
 
 @Test func multipleConfigurationsDecodeSuccessfully() throws {
@@ -764,11 +901,9 @@ private func decodeMP3(at url: URL) throws -> (format: AVAudioFormat, buffer: AV
 
   let sampleCount = Int(buffer.frameLength)
   let samples = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: sampleCount))
-
-  var peak: Float = 0
-  vDSP_maxv(samples.map { abs($0) }, 1, &peak, vDSP_Length(sampleCount))
-  #expect(peak > 0.05, "Decoded mono sine wave should have energy")
+  #expect(peak(samples) > 0.45, "Decoded mono sine wave should have energy")
 }
+#endif
 
 // MARK: - Determinism and Invariant Tests
 
