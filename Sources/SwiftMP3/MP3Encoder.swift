@@ -15,9 +15,14 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     case jointStereo
   }
 
-  /// Sample rate in Hz. 32000, 44100, and 48000 encode MPEG-1; 16000, 22050, and 24000
-  /// encode MPEG-2; 8000, 11025, and 12000 encode MPEG-2.5.
+  /// Sample rate of the input in Hz. Any positive rate works: one MP3 can't store is
+  /// resampled to ``outputSampleRate``.
   public var sampleRate: Int
+  /// Sample rate of the MP3 in Hz, or `nil` to use ``sampleRate`` when MP3 supports it and
+  /// the nearest rate that keeps the input's bandwidth when it doesn't (44100 or 48000
+  /// above 48 kHz). 32000, 44100, and 48000 encode MPEG-1; 16000, 22050, and 24000 encode
+  /// MPEG-2; 8000, 11025, and 12000 encode MPEG-2.5.
+  public var outputSampleRate: Int?
   /// Bitrate in kbps for CBR, or the maximum average bitrate for VBR. MPEG-1 allows 32,
   /// 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, and 320. MPEG-2 and 2.5 allow
   /// 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, and 160.
@@ -40,11 +45,14 @@ public struct MP3EncoderOptions: Sendable, Equatable {
 
   /// Creates a new set of encoder options.
   /// - Parameters:
-  ///   - sampleRate: Sample rate in Hz. Defaults to 44100.
+  ///   - sampleRate: Sample rate of the input in Hz. Defaults to 44100.
+  ///   - outputSampleRate: Sample rate of the MP3 in Hz, or `nil` to pick one from
+  ///     `sampleRate`. Defaults to `nil`.
   ///   - bitrateKbps: Bitrate in kbps; one of the bitrates for the sample rate's MPEG
   ///     version. Defaults to 128.
   ///   - vbr: Vary the bitrate per frame, averaging at most `bitrateKbps`. Defaults to `false`.
-  ///   - mode: Channel mode. Defaults to `.stereo`.
+  ///   - mode: Channel mode. Defaults to `.jointStereo`, which switches each frame to
+  ///     mid/side coding when that needs fewer bits.
   ///   - quality: Quality level from 0 (best) to 9 (fastest). Defaults to 5.
   ///   - crcProtected: Enable CRC protection. Defaults to `false`.
   ///   - original: Set the original flag. Defaults to `true`.
@@ -52,9 +60,10 @@ public struct MP3EncoderOptions: Sendable, Equatable {
   ///   - id3Tag: ID3v2.3 metadata to embed. Defaults to `nil`.
   public init(
     sampleRate: Int = 44_100,
+    outputSampleRate: Int? = nil,
     bitrateKbps: Int = 128,
     vbr: Bool = false,
-    mode: Mode = .stereo,
+    mode: Mode = .jointStereo,
     quality: Int = 5,
     crcProtected: Bool = false,
     original: Bool = true,
@@ -62,6 +71,7 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     id3Tag: ID3Tag? = nil
   ) {
     self.sampleRate = sampleRate
+    self.outputSampleRate = outputSampleRate
     self.bitrateKbps = bitrateKbps
     self.vbr = vbr
     self.mode = mode
@@ -74,11 +84,20 @@ public struct MP3EncoderOptions: Sendable, Equatable {
 
   /// Number of interleaved channels expected in the input.
   var channelCount: Int { mode == .mono ? 1 : 2 }
+
+  /// The rate the MP3 is encoded at: ``outputSampleRate``, or the one picked for ``sampleRate``.
+  var encodedSampleRate: Int {
+    if let outputSampleRate { return outputSampleRate }
+    let rates = MPEGVersion.allSampleRates.sorted()
+    if rates.contains(sampleRate) { return sampleRate }
+    if sampleRate > 48_000 { return sampleRate % 11_025 == 0 ? 44_100 : 48_000 }
+    return rates.first { $0 >= sampleRate } ?? 48_000
+  }
 }
 
 /// An error from configuring the encoder or passing it input.
 public enum MP3EncoderError: Error, Equatable, Sendable, CustomStringConvertible {
-  /// The sample rate isn't one MP3 supports.
+  /// The input sample rate isn't positive, or the output sample rate isn't one MP3 supports.
   case unsupportedSampleRate(Int)
   /// The bitrate isn't available at the sample rate's MPEG version.
   case unsupportedBitrate(Int, sampleRate: Int)
@@ -123,12 +142,17 @@ public struct MP3Encoder: Sendable {
   /// Creates a new MP3 encoder with the given options.
   /// - Parameter options: Configuration for sample rate, bitrate, channel mode, etc.
   /// - Throws: ``MP3EncoderError`` if the sample rate, bitrate, or quality isn't supported.
+  ///   The bitrate is checked against the output sample rate.
   public init(options: MP3EncoderOptions) throws {
-    guard let version = MPEGVersion(sampleRate: options.sampleRate) else {
+    guard options.sampleRate > 0 else {
       throw MP3EncoderError.unsupportedSampleRate(options.sampleRate)
     }
+    let rate = options.encodedSampleRate
+    guard let version = MPEGVersion(sampleRate: rate) else {
+      throw MP3EncoderError.unsupportedSampleRate(rate)
+    }
     guard options.bitrateKbps > 0, version.bitrates.contains(options.bitrateKbps) else {
-      throw MP3EncoderError.unsupportedBitrate(options.bitrateKbps, sampleRate: options.sampleRate)
+      throw MP3EncoderError.unsupportedBitrate(options.bitrateKbps, sampleRate: rate)
     }
     guard (0...9).contains(options.quality) else {
       throw MP3EncoderError.invalidQuality(options.quality)
@@ -148,14 +172,51 @@ public struct MP3Encoder: Sendable {
   public func encode<S: AsyncSequence & Sendable>(
     _ input: S
   ) -> AsyncThrowingStream<Data, Error> where S.Element == [Float] {
+    stream(input) { session, samples in session.encode(samples: samples) }
+  }
+
+  /// Streaming encode of interleaved 16-bit samples, like the float-sample `encode(_:)`.
+  public func encode<S: AsyncSequence & Sendable>(
+    _ input: S
+  ) -> AsyncThrowingStream<Data, Error> where S.Element == [Int16] {
+    stream(input) { session, samples in session.encode(samples: samples) }
+  }
+
+  /// File encode: writes MP3 frames incrementally to disk with a Xing header.
+  ///
+  /// Creates the file at `url`, writes encoded frames as they are produced, then
+  /// seeks back to the beginning to write the Xing header for accurate seeking. If
+  /// encoding fails or is cancelled, the partly written file is removed.
+  ///
+  /// - Parameters:
+  ///   - input: An async sequence of interleaved PCM float sample buffers.
+  ///   - url: The file URL to write the MP3 output to.
+  public func encode<S: AsyncSequence & Sendable>(
+    _ input: S, to url: URL
+  ) async throws where S.Element == [Float] {
+    try await write(input, to: url) { session, samples in session.encode(samples: samples) }
+  }
+
+  /// File encode of interleaved 16-bit samples, like the float-sample `encode(_:to:)`.
+  public func encode<S: AsyncSequence & Sendable>(
+    _ input: S, to url: URL
+  ) async throws where S.Element == [Int16] {
+    try await write(input, to: url) { session, samples in session.encode(samples: samples) }
+  }
+
+  /// Encodes each element of `input` with `feed`, yielding the MP3 frames.
+  func stream<S: AsyncSequence & Sendable>(
+    _ input: S,
+    feed: @escaping @Sendable (inout EncoderSession, S.Element) throws -> Data
+  ) -> AsyncThrowingStream<Data, Error> {
     let options = self.options
     return AsyncThrowingStream { continuation in
       let task = Task {
         var state = EncoderSession(options: options)
         do {
-          for try await samples in input {
+          for try await element in input {
             try Task.checkCancellation()
-            let data = state.encode(samples: samples)
+            let data = try feed(&state, element)
             if !data.isEmpty {
               continuation.yield(data)
             }
@@ -175,17 +236,13 @@ public struct MP3Encoder: Sendable {
     }
   }
 
-  /// File encode: writes MP3 frames incrementally to disk with a Xing header.
-  ///
-  /// Creates the file at `url`, writes encoded frames as they are produced, then
-  /// seeks back to the beginning to write the Xing header for accurate seeking.
-  ///
-  /// - Parameters:
-  ///   - input: An async sequence of interleaved PCM float sample buffers.
-  ///   - url: The file URL to write the MP3 output to.
-  public func encode<S: AsyncSequence & Sendable>(
-    _ input: S, to url: URL
-  ) async throws where S.Element == [Float] {
+  /// Encodes each element of `input` with `feed` into a file at `url`, removing the file
+  /// if anything throws.
+  func write<S: AsyncSequence>(
+    _ input: S,
+    to url: URL,
+    feed: (inout EncoderSession, S.Element) throws -> Data
+  ) async throws {
     var state = EncoderSession(options: self.options)
 
     let id3Data = state.generateID3Tag()
@@ -196,26 +253,39 @@ public struct MP3Encoder: Sendable {
     fileHeader.append(Data(count: xingFrameSize))
     try fileHeader.write(to: url)
 
-    let handle = try FileHandle(forWritingTo: url)
-    defer { try? handle.close() }
-    try handle.seek(toOffset: UInt64(id3Data.count + xingFrameSize))
+    let handle: FileHandle
+    do {
+      handle = try FileHandle(forWritingTo: url)
+    } catch {
+      try? FileManager.default.removeItem(at: url)
+      throw error
+    }
+    do {
+      try handle.seek(toOffset: UInt64(id3Data.count + xingFrameSize))
 
-    for try await samples in input {
-      try Task.checkCancellation()
-      let data = state.encode(samples: samples)
-      if !data.isEmpty {
-        try handle.write(contentsOf: data)
+      for try await element in input {
+        try Task.checkCancellation()
+        let data = try feed(&state, element)
+        if !data.isEmpty {
+          try handle.write(contentsOf: data)
+        }
       }
-    }
+      try Task.checkCancellation()
 
-    let finalData = state.flush()
-    if !finalData.isEmpty {
-      try handle.write(contentsOf: finalData)
-    }
+      let finalData = state.flush()
+      if !finalData.isEmpty {
+        try handle.write(contentsOf: finalData)
+      }
 
-    // Write the real Xing header after the ID3 tag
-    let xingHeader = state.generateXingHeader()
-    try handle.seek(toOffset: UInt64(id3Data.count))
-    try handle.write(contentsOf: xingHeader)
+      // Write the real Xing header after the ID3 tag
+      let xingHeader = state.generateXingHeader()
+      try handle.seek(toOffset: UInt64(id3Data.count))
+      try handle.write(contentsOf: xingHeader)
+      try handle.close()
+    } catch {
+      try? handle.close()
+      try? FileManager.default.removeItem(at: url)
+      throw error
+    }
   }
 }

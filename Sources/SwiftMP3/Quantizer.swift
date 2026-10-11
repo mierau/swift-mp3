@@ -627,6 +627,8 @@ private struct GranuleQuantization {
   func quantizeAll(_ info: GranuleInfo) -> Bool {
     #if canImport(Accelerate)
     if quantizeAllVector(info) { return true }
+    #else
+    if quantizeAllSIMD(info) { return true }
     #endif
     var ok = true
     let threshold = tables.roundingThreshold
@@ -652,6 +654,51 @@ private struct GranuleQuantization {
     }
     return ok
   }
+
+  #if !canImport(Accelerate)
+  /// ``quantizeAll(_:)`` eight lines at a time with SIMD types, producing identical
+  /// values. Returns `false`, leaving `ix` unspecified, if any value overflows.
+  private func quantizeAllSIMD(_ info: GranuleInfo) -> Bool {
+    let steps = scratch
+    // Lines up to the end of the band holding `lastLine`; the rest quantize to zero.
+    var n = 0
+    for band in 0..<layout.count {
+      let start = layout.start[band]
+      guard start < lastLine else { break }
+      let step = tables.inverseStep(stepExponent(info, band: band))
+      n = layout.end[band]
+      (steps + start).update(repeating: step, count: n - start)
+    }
+    let vectorEnd = (n + 7) & ~7
+    (steps + n).update(repeating: 0, count: vectorEnd - n)
+    let threshold = tables.roundingThreshold
+    let zeroThreshold = threshold[0]
+    let limit = SIMD8<Float>(repeating: 8206)
+    let magic = SIMD8<Float>(repeating: 8_388_608)
+    let one = SIMD8<Float>(repeating: 1)
+    var i = 0
+    while i < vectorEnd {
+      let x = UnsafeRawPointer(xr34 + i).loadUnaligned(as: SIMD8<Float>.self)
+      let s = UnsafeRawPointer(steps + i).loadUnaligned(as: SIMD8<Float>.self)
+      let v = x * s
+      if any(v .>= limit) { return false }
+      // floor(v) as in ``Quantizer/floor(_:)``, then one more where the remainder reaches
+      // the rounding threshold.
+      var q = unsafeBitCast(v + magic, to: SIMD8<Int32>.self) &- 0x4B00_0000
+      q.replace(with: q &- 1, where: SIMD8<Float>(q) .> v)
+      let remainder = v - SIMD8<Float>(q)
+      var t = SIMD8<Float>(repeating: zeroThreshold)
+      if any(v .>= one) {
+        for lane in 0..<8 { t[lane] = threshold[Int(q[lane])] }
+      }
+      q.replace(with: q &+ 1, where: remainder .>= t)
+      UnsafeMutableRawPointer(ix + i).storeBytes(of: q, as: SIMD8<Int32>.self)
+      i += 8
+    }
+    (ix + vectorEnd).update(repeating: 0, count: 576 - vectorEnd)
+    return true
+  }
+  #endif
 
   #if canImport(Accelerate)
   /// ``quantizeAll(_:)`` with vDSP, producing identical values. Returns `false`, leaving

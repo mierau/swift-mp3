@@ -7,27 +7,30 @@ A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG Layer II
 ## Features
 
 - MPEG-1 Layer III at 32, 44.1, and 48 kHz, and MPEG-2/2.5 at 8 to 24 kHz for low-bitrate speech
+- Any input sample rate: 88.2, 96, 192 kHz or anything else MP3 can't store is resampled
 - CBR and VBR encoding modes, with a bit reservoir
+- Scores higher than LAME on ViSQOL at the same bitrate, with smaller VBR files (see [Quality](#quality))
 - Mono, stereo, and joint stereo
 - Streaming encoding — feed samples incrementally
 - Async/await support with `AsyncSequence` input
 - File encoding with automatic Xing header
 - Xing/Info and LAME tags for accurate seeking and gapless playback
-- Float, 16-bit integer, planar, and `AVAudioPCMBuffer` input
+- ReplayGain 2.0 track gain and peak (ITU-R BS.1770 loudness) in the LAME tag
+- Float, 16-bit integer, planar, and `AVAudioPCMBuffer` input, with downmixing to mono
 - Psychoacoustic model (spreading, tonality, absolute threshold of hearing, pre-echo control)
 - Noise-shaping quantization with scalefactors, pre-emphasis, and scalefactor sharing
 - Transient detection with long/short block switching
 - Mid/side stereo chosen per frame
 - ISO 11172-3 compliant Huffman coding and polyphase filterbank
-- Encodes 50-200x faster than realtime on one core
+- Encodes 40-250x faster than realtime on one core, using Accelerate on Apple platforms and SIMD elsewhere
 - ID3v2.3 metadata tagging (title, artist, album, artwork, etc.)
 - Fully `Sendable` — safe to use from any concurrency context
 
 ## Requirements
 
-- Swift 5.10+
+- Swift 6.0+ (Xcode 16+)
 - macOS 13+, iOS 16+, tvOS 16+, watchOS 9+, visionOS 1+, or Linux
-- Swift 6 toolchain (Xcode 16+) to run the tests (Swift Testing); the decode round-trip tests use AVFoundation on Apple platforms and ffmpeg on Linux
+- The decode round-trip tests use AVFoundation on Apple platforms and ffmpeg on Linux
 
 ## Installation
 
@@ -64,7 +67,7 @@ import SwiftMP3
 let encoder = try MP3Encoder(options: MP3EncoderOptions(
   sampleRate: 44_100,
   bitrateKbps: 128,
-  mode: .stereo
+  mode: .jointStereo
 ))
 var session = encoder.newSession()
 
@@ -95,11 +98,31 @@ data.append(session.encode(planar: [left, right]))  // [[Float]], one array per 
 data.append(try session.encode(buffer: pcmBuffer))  // AVAudioPCMBuffer, float or int16
 ```
 
-The buffer must match the encoder's sample rate and channel count; use `AVAudioConverter` to convert it first if it doesn't.
+The buffer must match the encoder's input sample rate. A mono encoder averages planar or buffer input with any number of channels, and a stereo encoder plays mono input in both channels.
+
+`encode(_:)` and `encode(_:to:)` take an `AsyncSequence` of `[Int16]` as well as `[Float]`, and `encode(_:to:)` also takes a sequence of `AVAudioPCMBuffer`.
+
+### Sample Rates
+
+Set `sampleRate` to the rate of your input. If MP3 can't store that rate, the encoder resamples it, by default to the nearest rate that keeps its bandwidth (44.1 or 48 kHz above 48 kHz). Set `outputSampleRate` to choose the MP3's rate yourself, for example 22.05 kHz for speech:
+
+```swift
+let encoder = try MP3Encoder(options: MP3EncoderOptions(
+  sampleRate: 96_000,          // input
+  outputSampleRate: 44_100,    // MP3
+  bitrateKbps: 192
+))
+```
+
+Resampling keeps the output sample-exact, so gapless playback still trims correctly.
 
 ### Gapless Playback
 
 The Info frame from `generateXingHeader()` (and from `encode(_:to:)`) carries a LAME tag with the encoder delay and padding. Players that read it, such as ffmpeg and mpg123, trim them, so the decoded audio has exactly as many samples as the input and loops or consecutive tracks play without a gap.
+
+### Loudness
+
+The LAME tag also records the track's ReplayGain 2.0 gain (the change that brings it to -18 LUFS, measured per ITU-R BS.1770) and its peak sample, so players that support ReplayGain can level it. The same values are available as `session.replayGain` and `session.peakAmplitude`.
 
 ### Streaming Encode
 
@@ -116,7 +139,7 @@ for try await frame in encoder.encode(sampleSource) {
 
 ### File Encode
 
-Use `encode(_:to:)` to write directly to a file, including the Xing header for seeking:
+Use `encode(_:to:)` to write directly to a file, including the Xing header for seeking. If encoding fails or is cancelled, the partly written file is removed:
 
 ```swift
 let encoder = try MP3Encoder(options: options)
@@ -209,10 +232,11 @@ Configuration for the encoder.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
-| `sampleRate` | `Int` | `44_100` | Input sample rate; see [Sample Rates and Bitrates](#sample-rates-and-bitrates) |
+| `sampleRate` | `Int` | `44_100` | Input sample rate in Hz; any positive rate |
+| `outputSampleRate` | `Int?` | `nil` | MP3 sample rate; `nil` picks one from `sampleRate`. See [Sample Rates and Bitrates](#sample-rates-and-bitrates) |
 | `bitrateKbps` | `Int` | `128` | Bitrate in kbps; the maximum average for VBR |
 | `vbr` | `Bool` | `false` | Give each frame only the bits its masking threshold calls for |
-| `mode` | `Mode` | `.stereo` | Channel mode: `.mono`, `.stereo`, or `.jointStereo` |
+| `mode` | `Mode` | `.jointStereo` | Channel mode: `.mono`, `.stereo`, or `.jointStereo` (mid/side per frame) |
 | `quality` | `Int` | `5` | Encoding quality 0 (best) to 9 (fastest) |
 | `crcProtected` | `Bool` | `false` | Add CRC error detection to frames |
 | `original` | `Bool` | `true` | Set the original bit in frame headers |
@@ -227,8 +251,8 @@ Stateless, `Sendable` encoder that holds configuration. Safe to share across tas
 |---|---|
 | `init(options:) throws` | Create an encoder; throws `MP3EncoderError` for unsupported options |
 | `newSession() -> EncoderSession` | Create a mutable encoding session for synchronous use |
-| `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of sample buffers |
-| `encode(_:to:) async throws` | Encode an `AsyncSequence` directly to a file with Xing header (includes ID3 tag if set) |
+| `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of `[Float]` or `[Int16]` |
+| `encode(_:to:) async throws` | Encode an `AsyncSequence` of `[Float]`, `[Int16]`, or `AVAudioPCMBuffer` to a file with Xing header (includes ID3 tag if set) |
 
 ### `EncoderSession`
 
@@ -245,6 +269,9 @@ Mutable encoding session created via `MP3Encoder.newSession()`. Not `Sendable` �
 | `generateXingHeader() -> Data` | Generates the Xing/Info frame with a LAME tag (call after encoding is complete) |
 | `encodedFrameCount: Int` | Number of MP3 frames encoded so far |
 | `encodedByteCount: Int` | Total bytes of encoded audio data so far |
+| `sampleRate: Int` / `outputSampleRate: Int` | Input and MP3 sample rates |
+| `replayGain: Double?` | ReplayGain 2.0 track gain of the input so far, in dB |
+| `peakAmplitude: Float` | Largest absolute input sample so far |
 
 ### `ID3Tag`
 
@@ -272,13 +299,28 @@ Input samples are interleaved `Float` values in the range `-1.0` to `1.0`:
 
 ### Sample Rates and Bitrates
 
-The sample rate picks the MPEG version, which sets the bitrates available:
+The MP3's sample rate picks the MPEG version, which sets the bitrates available. Input at any other rate is resampled to one of these:
 
 | Version | Sample rates (Hz) | Bitrates (kbps) |
 |---|---|---|
 | MPEG-1 | 32000, 44100, 48000 | 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320 |
 | MPEG-2 | 16000, 22050, 24000 | 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 |
 | MPEG-2.5 | 8000, 11025, 12000 | 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 |
+
+## Quality
+
+Measured with [ViSQOL](https://github.com/google/visqol) 3.3.3 in audio mode (MOS-LQO, 1 to 5, higher is better), averaged over ten 48 kHz stereo music clips from ViSQOL's conformance set, against LAME 3.100 with its default quality. CBR sizes are equal by definition.
+
+| Mode | SwiftMP3 | LAME |
+|---|---|---|
+| CBR 96 kbps | 4.22 | 4.16 |
+| CBR 128 kbps | 4.42 | 4.35 |
+| CBR 192 kbps | 4.58 | 4.56 |
+| CBR 320 kbps | 4.71 | 4.70 |
+| VBR, quality 5 vs. LAME `-V 2` | 4.49 at 2.49 MB | 4.48 at 3.03 MB |
+| VBR, quality 9 vs. LAME `-V 4` | 4.43 at 1.92 MB | 4.35 at 2.35 MB |
+
+ViSQOL is a model of listening, not a listening test, but it tracks the artifacts that matter at these bitrates: missing high frequencies and audible quantization noise.
 
 ## Documentation
 
@@ -289,7 +331,10 @@ API documentation can be built locally in Xcode with **Product › Build Documen
 ```sh
 swift build
 swift test
+swift run -c release SwiftMP3Benchmark   # encode speed on synthetic signals
 ```
+
+`SwiftMP3Benchmark --hashes` also prints a hash of each encode, to check that a change leaves the output byte-for-byte the same.
 
 ## License
 

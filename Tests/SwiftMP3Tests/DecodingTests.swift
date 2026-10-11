@@ -351,3 +351,29 @@ func gaplessDecodeMatchesInput(sampleRate: Int, bitrate: Int, mode: MP3EncoderOp
   let best = (-64...64).max { correlation($0) < correlation($1) }
   #expect(best == 0)
 }
+
+@Test(.enabled(if: TestDecoder.ffmpeg != nil))
+func resampledEncodeIsGapless() throws {
+  // 96 kHz input plays back at 48 kHz with exactly half as many samples, lined up.
+  var generator = SplitMix64(seed: 2)
+  let reference = musicLikeSignal(sampleRate: 48_000, channels: 1, seconds: 2)
+    .map { $0 + Float.random(in: -0.02...0.02, using: &generator) }
+  // Upsample by inserting the midpoint, which the encoder's resampler then removes.
+  var input = [Float]()
+  for i in reference.indices {
+    input.append(reference[i])
+    input.append(i + 1 < reference.count ? (reference[i] + reference[i + 1]) / 2 : reference[i] / 2)
+  }
+  let options = MP3EncoderOptions(sampleRate: 96_000, bitrateKbps: 160, mode: .mono)
+  let decoded = try TestDecoder.decodeWithFFmpeg(try encodeFile(input, options: options))
+  #expect(decoded.sampleRate == 48_000)
+  #expect(decoded.channels[0].count == reference.count)
+  func correlation(_ lag: Int) -> Double {
+    var sum = 0.0
+    for i in stride(from: 2_000, to: reference.count - 2_000, by: 2) {
+      sum += Double(reference[i]) * Double(decoded.channels[0][i + lag])
+    }
+    return sum
+  }
+  #expect((-32...32).max { correlation($0) < correlation($1) } == 0)
+}

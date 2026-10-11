@@ -19,6 +19,9 @@ public struct EncoderSession {
   private let targetBitrateIndex: Int
 
   // Input
+  /// Converts the input to the MP3's sample rate, when they differ.
+  private var resampler: Resampler?
+  /// Input at the MP3's sample rate, interleaved, not yet analyzed.
   private var pcm: [Float] = []
   private var inputSamples = 0
   private var finished = false
@@ -66,9 +69,14 @@ public struct EncoderSession {
   private var frameSizes: [UInt16] = []
   /// CRC of the audio frames, for the LAME tag.
   private var musicCRC: UInt16 = 0
+  /// Loudness and peak of the input, for the LAME tag's ReplayGain fields.
+  private var loudness: LoudnessMeter
 
   /// The sample rate of the input, in Hz.
-  public var sampleRate: Int { format.sampleRate }
+  public var sampleRate: Int { options.sampleRate }
+
+  /// The sample rate of the encoded MP3, in Hz.
+  public var outputSampleRate: Int { format.sampleRate }
 
   /// The number of interleaved channels in the input.
   public var channelCount: Int { channels }
@@ -79,11 +87,22 @@ public struct EncoderSession {
   /// The total bytes of encoded audio data so far (excluding the Xing header).
   public var encodedByteCount: Int { totalBytes }
 
+  /// The ReplayGain 2.0 track gain of the input so far, in dB: the change in level that
+  /// brings it to -18 LUFS (ITU-R BS.1770). `nil` until there's 400 ms of audible input.
+  /// ``generateXingHeader()`` records it in the LAME tag.
+  public var replayGain: Double? { loudness.trackGain }
+
+  /// The largest absolute sample value of the input so far (1.0 is full scale).
+  public var peakAmplitude: Float { loudness.peak }
+
   /// Creates a new encoding state for options that ``MP3Encoder/init(options:)`` validated.
   init(options: MP3EncoderOptions) {
     self.options = options
     channels = options.channelCount
-    format = StreamFormat(sampleRate: options.sampleRate, channels: channels)!
+    format = StreamFormat(sampleRate: options.encodedSampleRate, channels: channels)!
+    if options.sampleRate != format.sampleRate {
+      resampler = Resampler(inputRate: options.sampleRate, outputRate: format.sampleRate, channels: channels)
+    }
     targetBitrateIndex = format.bitrateIndex(for: options.bitrateKbps)!
 
     let granule = [Float](repeating: 0, count: MPEG.samplesPerGranule)
@@ -118,6 +137,7 @@ public struct EncoderSession {
     lowpassLong = min(576, Int((cutoff / (Double(sampleRate) / 2) * 576).rounded()))
     lowpassShort = min(192, Int((cutoff / (Double(sampleRate) / 2) * 192).rounded()))
 
+    loudness = LoudnessMeter(sampleRate: format.sampleRate, channels: channels)
     psychoacoustics = PsychoacousticModel(format: format, quality: options.quality)
     quantizer = Quantizer(format: format, quality: options.quality)
     frameSizes.reserveCapacity(4096)
@@ -155,16 +175,31 @@ public struct EncoderSession {
 
   /// Appends non-interleaved PCM samples, one array per channel, and encodes any complete frames.
   ///
+  /// A mono encoder averages any number of channels; a stereo encoder plays one channel
+  /// in both.
+  ///
   /// - Parameter channels: One array per channel (left then right for stereo), all the
-  ///   same length, normalized to [-1.0, 1.0].
+  ///   same length, normalized to [-1.0, 1.0]. A stereo encoder takes one or two.
   public mutating func encode(planar channels: [[Float]]) -> Data {
-    precondition(channels.count == self.channels, "Expected \(self.channels) channels, got \(channels.count)")
+    precondition(!channels.isEmpty, "Expected at least one channel")
+    precondition(self.channels == 1 || channels.count <= 2, "Expected 1 or 2 channels, got \(channels.count)")
     let length = channels.first?.count ?? 0
     precondition(channels.allSatisfy { $0.count == length }, "Channels must have the same length")
-    if self.channels == 1 { return encode(samples: channels[0]) }
+    if self.channels == 1 {
+      guard channels.count > 1 else { return encode(samples: channels[0]) }
+      return append(count: length) { pcm in
+        let scale = 1 / Float(channels.count)
+        pcm.reserveCapacity(pcm.count + length)
+        for i in 0..<length {
+          var sum: Float = 0
+          for channel in channels { sum += channel[i] }
+          pcm.append(sum * scale)
+        }
+      }
+    }
     return append(count: length * 2) { pcm in
       let left = channels[0]
-      let right = channels[1]
+      let right = channels[channels.count - 1]
       pcm.reserveCapacity(pcm.count + length * 2)
       for i in 0..<length {
         pcm.append(left[i])
@@ -176,8 +211,17 @@ public struct EncoderSession {
   /// Adds `count` samples through `body` and encodes whatever they complete.
   private mutating func append(count: Int, _ body: (inout [Float]) -> Void) -> Data {
     guard !finished else { return Data() }
-    body(&pcm)
-    inputSamples += count
+    let before = pcm.count
+    if resampler == nil {
+      body(&pcm)
+    } else {
+      var input = [Float]()
+      input.reserveCapacity(count)
+      body(&input)
+      input.withUnsafeBufferPointer { resampler!.process($0, into: &pcm) }
+    }
+    inputSamples += pcm.count - before
+    loudness.add(pcm[before...])
     var output: [UInt8] = []
     processBufferedInput(into: &output)
     return Data(output)
@@ -193,6 +237,12 @@ public struct EncoderSession {
     guard !finished else { return Data() }
     finished = true
     var output: [UInt8] = []
+    if resampler != nil {
+      let before = pcm.count
+      resampler!.finish(into: &pcm)
+      inputSamples += pcm.count - before
+      loudness.add(pcm[before...])
+    }
     guard inputSamples > 0 else { return Data() }
 
     // A trailing partial sample frame is completed with silence.
@@ -220,7 +270,7 @@ public struct EncoderSession {
     return Data(output)
   }
 
-  /// Number of input sample frames (one sample per channel) received so far.
+  /// Number of sample frames (one sample per channel) received so far, at the MP3's rate.
   private var inputFrameCount: Int { (inputSamples + channels - 1) / channels }
 
   /// Generates the ID3v2.3 tag data for the configured metadata.
@@ -336,7 +386,8 @@ public struct EncoderSession {
     }
   }
 
-  /// Lowpass frequency for a bitrate, after LAME's bandwidth table for stereo.
+  /// Lowpass frequency for a bitrate: 10% above LAME's bandwidth table for stereo, which
+  /// scored better on ViSQOL at every bitrate tested (96-320 kbps).
   static func lowpassFrequency(kbps: Int, channels: Int, sampleRate: Int) -> Double {
     let table: [(Int, Double)] = [
       (8, 2000), (16, 3700), (24, 3900), (32, 5500), (40, 7000), (48, 7500), (56, 10_000),
@@ -356,7 +407,7 @@ public struct EncoderSession {
         break
       }
     }
-    return min(cutoff, Double(sampleRate) / 2)
+    return min(cutoff * 1.1, Double(sampleRate) / 2)
   }
 
   // MARK: - Frame encoding
@@ -926,7 +977,7 @@ public struct EncoderSession {
     var tag = Array("LAMESwMP3".utf8)
     tag.append(options.vbr ? 2 : 1)  // Revision 0; VBR method: ABR or CBR
     tag.append(UInt8(min(255, (lowpassHz + 50) / 100)))
-    tag.append(contentsOf: repeatElement(0, count: 8))  // Peak and ReplayGain
+    tag.append(contentsOf: replayGainFields())
     tag.append(0)  // Encoding flags and ATH type
     tag.append(UInt8(min(255, options.bitrateKbps)))
     let delay = Self.encoderDelay
@@ -935,10 +986,11 @@ public struct EncoderSession {
     tag.append(UInt8((delay & 0xF) << 4 | padding >> 8))
     tag.append(UInt8(padding & 0xFF))
     let sourceRate: UInt8
-    switch format.sampleRate {
+    switch options.sampleRate {
     case ...32_000: sourceRate = 0
-    case 44_100: sourceRate = 1
-    default: sourceRate = 2
+    case ...44_100: sourceRate = 1
+    case ...48_000: sourceRate = 2
+    default: sourceRate = 3
     }
     let stereoMode: UInt8
     switch options.mode {
@@ -950,6 +1002,19 @@ public struct EncoderSession {
     tag.append(0)  // MP3 gain
     tag.append(contentsOf: [0, 0])  // Surround and preset
     return tag
+  }
+
+  /// Peak amplitude (fixed point, 1.0 = 2^23) and the radio (track) gain, with no
+  /// audiophile (album) gain.
+  private func replayGainFields() -> [UInt8] {
+    let peak = UInt32(min(Double(loudness.peak), 255) * Double(1 << 23)).bigEndianBytes
+    var radio: UInt16 = 0
+    if let gain = loudness.trackGain {
+      // Name code 1 (radio), originator 3 (automatic), sign, then tenths of a dB.
+      let tenths = UInt16(min((abs(gain) * 10).rounded(), 511))
+      radio = 0b001 << 13 | 0b011 << 10 | (gain < 0 ? 1 << 9 : 0) | tenths
+    }
+    return peak + [UInt8(radio >> 8), UInt8(radio & 0xFF), 0, 0]
   }
 
   /// The 100-entry seek table: byte position (scaled to 0-255) of each percent of duration.
