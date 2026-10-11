@@ -44,7 +44,8 @@ public struct MP3EncoderOptions: Sendable, Equatable {
   ///   - bitrateKbps: Bitrate in kbps; one of the bitrates for the sample rate's MPEG
   ///     version. Defaults to 128.
   ///   - vbr: Vary the bitrate per frame, averaging at most `bitrateKbps`. Defaults to `false`.
-  ///   - mode: Channel mode. Defaults to `.stereo`.
+  ///   - mode: Channel mode. Defaults to `.jointStereo`, which switches each frame to
+  ///     mid/side coding when that needs fewer bits.
   ///   - quality: Quality level from 0 (best) to 9 (fastest). Defaults to 5.
   ///   - crcProtected: Enable CRC protection. Defaults to `false`.
   ///   - original: Set the original flag. Defaults to `true`.
@@ -54,7 +55,7 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     sampleRate: Int = 44_100,
     bitrateKbps: Int = 128,
     vbr: Bool = false,
-    mode: Mode = .stereo,
+    mode: Mode = .jointStereo,
     quality: Int = 5,
     crcProtected: Bool = false,
     original: Bool = true,

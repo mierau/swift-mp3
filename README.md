@@ -64,7 +64,7 @@ import SwiftMP3
 let encoder = try MP3Encoder(options: MP3EncoderOptions(
   sampleRate: 44_100,
   bitrateKbps: 128,
-  mode: .stereo
+  mode: .jointStereo
 ))
 var session = encoder.newSession()
 
@@ -212,7 +212,7 @@ Configuration for the encoder.
 | `sampleRate` | `Int` | `44_100` | Input sample rate; see [Sample Rates and Bitrates](#sample-rates-and-bitrates) |
 | `bitrateKbps` | `Int` | `128` | Bitrate in kbps; the maximum average for VBR |
 | `vbr` | `Bool` | `false` | Give each frame only the bits its masking threshold calls for |
-| `mode` | `Mode` | `.stereo` | Channel mode: `.mono`, `.stereo`, or `.jointStereo` |
+| `mode` | `Mode` | `.jointStereo` | Channel mode: `.mono`, `.stereo`, or `.jointStereo` (mid/side per frame) |
 | `quality` | `Int` | `5` | Encoding quality 0 (best) to 9 (fastest) |
 | `crcProtected` | `Bool` | `false` | Add CRC error detection to frames |
 | `original` | `Bool` | `true` | Set the original bit in frame headers |

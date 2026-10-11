@@ -69,7 +69,7 @@ import Testing
   #expect(options.sampleRate == 44_100)
   #expect(options.bitrateKbps == 128)
   #expect(options.vbr == false)
-  #expect(options.mode == .stereo)
+  #expect(options.mode == .jointStereo)
   #expect(options.quality == 5)
 }
 
