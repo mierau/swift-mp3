@@ -341,3 +341,38 @@ func resamplerIsAccurateAndExact(input: Int, output: Int) {
   #expect(fromBuffer == fromArray)
 }
 #endif
+
+// MARK: - ReplayGain
+
+@Test(arguments: [48_000, 44_100, 22_050])
+func measuresLoudnessOfReferenceTone(sampleRate: Int) throws {
+  // EBU Tech 3341 case 1: a 1 kHz stereo sine at -23 dBFS measures -23 LUFS.
+  let amplitude = Float(pow(10, -23.0 / 20))
+  var input = [Float]()
+  for i in 0..<(sampleRate * 5) {
+    let value = amplitude * Float(sin(2 * Double.pi * 1_000 * Double(i) / Double(sampleRate)))
+    input += [value, value]
+  }
+  var session = try MP3Encoder(options: MP3EncoderOptions(sampleRate: sampleRate, bitrateKbps: 64)).newSession()
+  _ = session.encode(samples: input)
+  _ = session.flush()
+  let gain = try #require(session.replayGain)
+  #expect(abs(gain - 5) < 0.1, "Gain \(gain) dB")
+  #expect(abs(session.peakAmplitude - amplitude) < 1e-4)
+
+  // The LAME tag holds the peak (1.0 = 2^23) and the radio gain in tenths of a dB.
+  let header = [UInt8](session.generateXingHeader())
+  let tag = try #require(header.indices.first { header[$0...].starts(with: Array("LAMESwMP3".utf8)) })
+  let peak = header[(tag + 11)..<(tag + 15)].reduce(0) { $0 << 8 | Int($1) }
+  #expect(abs(Double(peak) / Double(1 << 23) - Double(amplitude)) < 1e-4)
+  let radio = Int(header[tag + 15]) << 8 | Int(header[tag + 16])
+  #expect(radio >> 13 == 1)
+  #expect(radio & 0x3FF == 50)
+}
+
+@Test func silenceHasNoReplayGain() throws {
+  var session = try MP3Encoder(options: MP3EncoderOptions()).newSession()
+  _ = session.encode(samples: [Float](repeating: 0, count: 88_200))
+  _ = session.flush()
+  #expect(session.replayGain == nil)
+}

@@ -69,6 +69,8 @@ public struct EncoderSession {
   private var frameSizes: [UInt16] = []
   /// CRC of the audio frames, for the LAME tag.
   private var musicCRC: UInt16 = 0
+  /// Loudness and peak of the input, for the LAME tag's ReplayGain fields.
+  private var loudness: LoudnessMeter
 
   /// The sample rate of the input, in Hz.
   public var sampleRate: Int { options.sampleRate }
@@ -84,6 +86,14 @@ public struct EncoderSession {
 
   /// The total bytes of encoded audio data so far (excluding the Xing header).
   public var encodedByteCount: Int { totalBytes }
+
+  /// The ReplayGain 2.0 track gain of the input so far, in dB: the change in level that
+  /// brings it to -18 LUFS (ITU-R BS.1770). `nil` until there's 400 ms of audible input.
+  /// ``generateXingHeader()`` records it in the LAME tag.
+  public var replayGain: Double? { loudness.trackGain }
+
+  /// The largest absolute sample value of the input so far (1.0 is full scale).
+  public var peakAmplitude: Float { loudness.peak }
 
   /// Creates a new encoding state for options that ``MP3Encoder/init(options:)`` validated.
   init(options: MP3EncoderOptions) {
@@ -127,6 +137,7 @@ public struct EncoderSession {
     lowpassLong = min(576, Int((cutoff / (Double(sampleRate) / 2) * 576).rounded()))
     lowpassShort = min(192, Int((cutoff / (Double(sampleRate) / 2) * 192).rounded()))
 
+    loudness = LoudnessMeter(sampleRate: format.sampleRate, channels: channels)
     psychoacoustics = PsychoacousticModel(format: format, quality: options.quality)
     quantizer = Quantizer(format: format, quality: options.quality)
     frameSizes.reserveCapacity(4096)
@@ -200,17 +211,17 @@ public struct EncoderSession {
   /// Adds `count` samples through `body` and encodes whatever they complete.
   private mutating func append(count: Int, _ body: (inout [Float]) -> Void) -> Data {
     guard !finished else { return Data() }
+    let before = pcm.count
     if resampler == nil {
       body(&pcm)
-      inputSamples += count
     } else {
       var input = [Float]()
       input.reserveCapacity(count)
       body(&input)
-      let before = pcm.count
       input.withUnsafeBufferPointer { resampler!.process($0, into: &pcm) }
-      inputSamples += pcm.count - before
     }
+    inputSamples += pcm.count - before
+    loudness.add(pcm[before...])
     var output: [UInt8] = []
     processBufferedInput(into: &output)
     return Data(output)
@@ -230,6 +241,7 @@ public struct EncoderSession {
       let before = pcm.count
       resampler!.finish(into: &pcm)
       inputSamples += pcm.count - before
+      loudness.add(pcm[before...])
     }
     guard inputSamples > 0 else { return Data() }
 
@@ -965,7 +977,7 @@ public struct EncoderSession {
     var tag = Array("LAMESwMP3".utf8)
     tag.append(options.vbr ? 2 : 1)  // Revision 0; VBR method: ABR or CBR
     tag.append(UInt8(min(255, (lowpassHz + 50) / 100)))
-    tag.append(contentsOf: repeatElement(0, count: 8))  // Peak and ReplayGain
+    tag.append(contentsOf: replayGainFields())
     tag.append(0)  // Encoding flags and ATH type
     tag.append(UInt8(min(255, options.bitrateKbps)))
     let delay = Self.encoderDelay
@@ -990,6 +1002,19 @@ public struct EncoderSession {
     tag.append(0)  // MP3 gain
     tag.append(contentsOf: [0, 0])  // Surround and preset
     return tag
+  }
+
+  /// Peak amplitude (fixed point, 1.0 = 2^23) and the radio (track) gain, with no
+  /// audiophile (album) gain.
+  private func replayGainFields() -> [UInt8] {
+    let peak = UInt32(min(Double(loudness.peak), 255) * Double(1 << 23)).bigEndianBytes
+    var radio: UInt16 = 0
+    if let gain = loudness.trackGain {
+      // Name code 1 (radio), originator 3 (automatic), sign, then tenths of a dB.
+      let tenths = UInt16(min((abs(gain) * 10).rounded(), 511))
+      radio = 0b001 << 13 | 0b011 << 10 | (gain < 0 ? 1 << 9 : 0) | tenths
+    }
+    return peak + [UInt8(radio >> 8), UInt8(radio & 0xFF), 0, 0]
   }
 
   /// The 100-entry seek table: byte position (scaled to 0-255) of each percent of duration.
