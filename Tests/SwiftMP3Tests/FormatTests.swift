@@ -40,8 +40,29 @@ func parseFrames(_ data: Data) -> [FrameHeader]? {
 // MARK: - Option validation
 
 @Test func rejectsUnsupportedSampleRate() {
+  #expect(throws: MP3EncoderError.unsupportedSampleRate(0)) {
+    try MP3Encoder(options: MP3EncoderOptions(sampleRate: 0))
+  }
   #expect(throws: MP3EncoderError.unsupportedSampleRate(44_000)) {
-    try MP3Encoder(options: MP3EncoderOptions(sampleRate: 44_000))
+    try MP3Encoder(options: MP3EncoderOptions(sampleRate: 48_000, outputSampleRate: 44_000))
+  }
+}
+
+@Test(arguments: [
+  (44_100, 44_100), (8_000, 8_000), (44_000, 44_100), (37_800, 44_100), (7_000, 8_000),
+  (88_200, 44_100), (96_000, 48_000), (176_400, 44_100), (192_000, 48_000), (50_000, 48_000),
+])
+func picksOutputSampleRate(input: Int, output: Int) throws {
+  let session = try MP3Encoder(options: MP3EncoderOptions(sampleRate: input, bitrateKbps: 64)).newSession()
+  #expect(session.sampleRate == input)
+  #expect(session.outputSampleRate == output)
+}
+
+@Test func checksBitrateAgainstOutputRate() throws {
+  // 96 kHz input encodes at 48 kHz, where 320 kbps is allowed but 144 kbps isn't.
+  _ = try MP3Encoder(options: MP3EncoderOptions(sampleRate: 96_000, bitrateKbps: 320))
+  #expect(throws: MP3EncoderError.unsupportedBitrate(144, sampleRate: 48_000)) {
+    try MP3Encoder(options: MP3EncoderOptions(sampleRate: 96_000, bitrateKbps: 144))
   }
 }
 
@@ -200,6 +221,80 @@ private func encodeAll(_ options: MP3EncoderOptions, _ body: (inout EncoderSessi
   #expect(whole == chunked)
 }
 
+@Test func monoEncoderAveragesPlanarChannels() throws {
+  let left = (0..<5_000).map { Float(sin(Double($0) * 0.03)) * 0.5 }
+  let right = (0..<5_000).map { Float(sin(Double($0) * 0.07)) * 0.3 }
+  let options = MP3EncoderOptions(mode: .mono)
+  let mixed = try encodeAll(options) { $0.encode(planar: [left, right]) }
+  let average = try encodeAll(options) { $0.encode(samples: zip(left, right).map { ($0 + $1) * 0.5 }) }
+  #expect(mixed == average)
+}
+
+@Test func stereoEncoderPlaysMonoInBothChannels() throws {
+  let mono = (0..<5_000).map { Float(sin(Double($0) * 0.03)) * 0.5 }
+  let options = MP3EncoderOptions(mode: .stereo)
+  let upmixed = try encodeAll(options) { $0.encode(planar: [mono]) }
+  let duplicated = try encodeAll(options) { $0.encode(samples: mono.flatMap { [$0, $0] }) }
+  #expect(upmixed == duplicated)
+}
+
+// MARK: - Resampling
+
+/// A sine of `frequency` Hz sampled at `rate`, `count` samples long, interleaved over `channels`.
+private func sine(_ frequency: Double, rate: Int, count: Int, channels: Int = 1) -> [Float] {
+  (0..<count).flatMap { i in
+    Array(repeating: Float(0.5 * sin(2 * .pi * frequency * Double(i) / Double(rate))), count: channels)
+  }
+}
+
+@Test(arguments: [(96_000, 48_000), (44_100, 48_000), (37_800, 44_100), (48_000, 22_050), (8_000, 11_025)])
+func resamplerIsAccurateAndExact(input: Int, output: Int) {
+  let count = input / 2 + 123
+  let samples = sine(1_000, rate: input, count: count, channels: 2)
+  var resampler = Resampler(inputRate: input, outputRate: output, channels: 2)
+  var result = [Float]()
+  samples.withUnsafeBufferPointer { resampler.process($0, into: &result) }
+  resampler.finish(into: &result)
+
+  // Exactly ceil(count * output / input) frames, with no delay.
+  let expectedFrames = (count * output + input - 1) / input
+  #expect(result.count == expectedFrames * 2)
+  let ideal = sine(1_000, rate: output, count: expectedFrames)
+  var signal = 0.0
+  var noise = 0.0
+  for i in 200..<(expectedFrames - 200) {
+    signal += Double(ideal[i] * ideal[i])
+    noise += Double((result[2 * i] - ideal[i]) * (result[2 * i] - ideal[i]))
+    noise += Double((result[2 * i + 1] - ideal[i]) * (result[2 * i + 1] - ideal[i]))
+  }
+  let snr = 10 * log10(2 * signal / max(noise, 1e-30))
+  #expect(snr > 70, "SNR \(snr) dB")
+}
+
+@Test func resamplerHandlesOddChunks() {
+  let samples = sine(440, rate: 96_000, count: 20_001, channels: 2)
+  func run(_ chunks: [Int]) -> [Float] {
+    var resampler = Resampler(inputRate: 96_000, outputRate: 44_100, channels: 2)
+    var result = [Float]()
+    var start = 0
+    for size in chunks + [samples.count] where start < samples.count {
+      let end = min(start + size, samples.count)
+      samples[start..<end].withUnsafeBufferPointer { resampler.process($0, into: &result) }
+      start = end
+    }
+    resampler.finish(into: &result)
+    return result
+  }
+  #expect(run([1, 3, 1_000, 7, 9_999]) == run([]))
+}
+
+@Test func resampledInputEncodesAtOutputRate() throws {
+  let input = sine(1_000, rate: 96_000, count: 96_000, channels: 2)
+  let file = try encodeFile(input, options: MP3EncoderOptions(sampleRate: 96_000, bitrateKbps: 192))
+  let frames = try #require(parseFrames(file))
+  #expect(frames.allSatisfy { $0.sampleRate == 48_000 })
+}
+
 #if canImport(AVFAudio)
 @Test func audioBufferInputMatchesFloatInput() throws {
   let frames = 4_000
@@ -225,5 +320,24 @@ private func encodeAll(_ options: MP3EncoderOptions, _ body: (inout EncoderSessi
   let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16)!
   var session = try MP3Encoder(options: MP3EncoderOptions()).newSession()
   #expect(throws: MP3EncoderError.self) { try session.encode(buffer: buffer) }
+}
+
+@Test func monoEncoderAveragesStereoBuffer() throws {
+  let frames = 4_000
+  let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: true)!
+  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))!
+  buffer.frameLength = AVAudioFrameCount(frames)
+  var mono = [Float]()
+  for i in 0..<frames {
+    let l = Float(sin(Double(i) * 0.03)) * 0.5
+    let r = Float(sin(Double(i) * 0.05)) * 0.3
+    buffer.floatChannelData![0][2 * i] = l
+    buffer.floatChannelData![0][2 * i + 1] = r
+    mono.append((l + r) * 0.5)
+  }
+  let options = MP3EncoderOptions(mode: .mono)
+  let fromBuffer = try encodeAll(options) { try $0.encode(buffer: buffer) }
+  let fromArray = try encodeAll(options) { $0.encode(samples: mono) }
+  #expect(fromBuffer == fromArray)
 }
 #endif

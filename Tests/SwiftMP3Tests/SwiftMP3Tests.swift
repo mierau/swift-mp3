@@ -166,6 +166,35 @@ import Testing
   #expect(containsTag)
 }
 
+@Test func encodeInt16Stream() async throws {
+  let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
+  let encoder = try MP3Encoder(options: options)
+  let chunks = (0..<4).map { c in (0..<4_608).map { Int16(truncatingIfNeeded: (c * 4_608 + $0) * 37 % 20_000) } }
+  let source = AsyncStream<[Int16]> { continuation in
+    for chunk in chunks { continuation.yield(chunk) }
+    continuation.finish()
+  }
+  var streamed = Data()
+  for try await data in encoder.encode(source) { streamed.append(data) }
+  var session = encoder.newSession()
+  var direct = Data()
+  for chunk in chunks { direct.append(session.encode(samples: chunk)) }
+  direct.append(session.flush())
+  #expect(streamed == direct)
+}
+
+@Test func failedFileEncodeRemovesFile() async throws {
+  struct SourceFailed: Error {}
+  let encoder = try MP3Encoder(options: MP3EncoderOptions())
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent("failed_\(UUID().uuidString).mp3")
+  let source = AsyncThrowingStream<[Float], Error> { continuation in
+    continuation.yield([Float](repeating: 0.1, count: 44_100))
+    continuation.finish(throwing: SourceFailed())
+  }
+  await #expect(throws: SourceFailed.self) { try await encoder.encode(source, to: url) }
+  #expect(!FileManager.default.fileExists(atPath: url.path))
+}
+
 @Test func encodeEmptyStream() async throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128, mode: .stereo)
   let encoder = try MP3Encoder(options: options)

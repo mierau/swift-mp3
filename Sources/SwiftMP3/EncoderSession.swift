@@ -19,6 +19,9 @@ public struct EncoderSession {
   private let targetBitrateIndex: Int
 
   // Input
+  /// Converts the input to the MP3's sample rate, when they differ.
+  private var resampler: Resampler?
+  /// Input at the MP3's sample rate, interleaved, not yet analyzed.
   private var pcm: [Float] = []
   private var inputSamples = 0
   private var finished = false
@@ -68,7 +71,10 @@ public struct EncoderSession {
   private var musicCRC: UInt16 = 0
 
   /// The sample rate of the input, in Hz.
-  public var sampleRate: Int { format.sampleRate }
+  public var sampleRate: Int { options.sampleRate }
+
+  /// The sample rate of the encoded MP3, in Hz.
+  public var outputSampleRate: Int { format.sampleRate }
 
   /// The number of interleaved channels in the input.
   public var channelCount: Int { channels }
@@ -83,7 +89,10 @@ public struct EncoderSession {
   init(options: MP3EncoderOptions) {
     self.options = options
     channels = options.channelCount
-    format = StreamFormat(sampleRate: options.sampleRate, channels: channels)!
+    format = StreamFormat(sampleRate: options.encodedSampleRate, channels: channels)!
+    if options.sampleRate != format.sampleRate {
+      resampler = Resampler(inputRate: options.sampleRate, outputRate: format.sampleRate, channels: channels)
+    }
     targetBitrateIndex = format.bitrateIndex(for: options.bitrateKbps)!
 
     let granule = [Float](repeating: 0, count: MPEG.samplesPerGranule)
@@ -155,16 +164,31 @@ public struct EncoderSession {
 
   /// Appends non-interleaved PCM samples, one array per channel, and encodes any complete frames.
   ///
+  /// A mono encoder averages any number of channels; a stereo encoder plays one channel
+  /// in both.
+  ///
   /// - Parameter channels: One array per channel (left then right for stereo), all the
-  ///   same length, normalized to [-1.0, 1.0].
+  ///   same length, normalized to [-1.0, 1.0]. A stereo encoder takes one or two.
   public mutating func encode(planar channels: [[Float]]) -> Data {
-    precondition(channels.count == self.channels, "Expected \(self.channels) channels, got \(channels.count)")
+    precondition(!channels.isEmpty, "Expected at least one channel")
+    precondition(self.channels == 1 || channels.count <= 2, "Expected 1 or 2 channels, got \(channels.count)")
     let length = channels.first?.count ?? 0
     precondition(channels.allSatisfy { $0.count == length }, "Channels must have the same length")
-    if self.channels == 1 { return encode(samples: channels[0]) }
+    if self.channels == 1 {
+      guard channels.count > 1 else { return encode(samples: channels[0]) }
+      return append(count: length) { pcm in
+        let scale = 1 / Float(channels.count)
+        pcm.reserveCapacity(pcm.count + length)
+        for i in 0..<length {
+          var sum: Float = 0
+          for channel in channels { sum += channel[i] }
+          pcm.append(sum * scale)
+        }
+      }
+    }
     return append(count: length * 2) { pcm in
       let left = channels[0]
-      let right = channels[1]
+      let right = channels[channels.count - 1]
       pcm.reserveCapacity(pcm.count + length * 2)
       for i in 0..<length {
         pcm.append(left[i])
@@ -176,8 +200,17 @@ public struct EncoderSession {
   /// Adds `count` samples through `body` and encodes whatever they complete.
   private mutating func append(count: Int, _ body: (inout [Float]) -> Void) -> Data {
     guard !finished else { return Data() }
-    body(&pcm)
-    inputSamples += count
+    if resampler == nil {
+      body(&pcm)
+      inputSamples += count
+    } else {
+      var input = [Float]()
+      input.reserveCapacity(count)
+      body(&input)
+      let before = pcm.count
+      input.withUnsafeBufferPointer { resampler!.process($0, into: &pcm) }
+      inputSamples += pcm.count - before
+    }
     var output: [UInt8] = []
     processBufferedInput(into: &output)
     return Data(output)
@@ -193,6 +226,11 @@ public struct EncoderSession {
     guard !finished else { return Data() }
     finished = true
     var output: [UInt8] = []
+    if resampler != nil {
+      let before = pcm.count
+      resampler!.finish(into: &pcm)
+      inputSamples += pcm.count - before
+    }
     guard inputSamples > 0 else { return Data() }
 
     // A trailing partial sample frame is completed with silence.
@@ -220,7 +258,7 @@ public struct EncoderSession {
     return Data(output)
   }
 
-  /// Number of input sample frames (one sample per channel) received so far.
+  /// Number of sample frames (one sample per channel) received so far, at the MP3's rate.
   private var inputFrameCount: Int { (inputSamples + channels - 1) / channels }
 
   /// Generates the ID3v2.3 tag data for the configured metadata.
@@ -936,10 +974,11 @@ public struct EncoderSession {
     tag.append(UInt8((delay & 0xF) << 4 | padding >> 8))
     tag.append(UInt8(padding & 0xFF))
     let sourceRate: UInt8
-    switch format.sampleRate {
+    switch options.sampleRate {
     case ...32_000: sourceRate = 0
-    case 44_100: sourceRate = 1
-    default: sourceRate = 2
+    case ...44_100: sourceRate = 1
+    case ...48_000: sourceRate = 2
+    default: sourceRate = 3
     }
     let stereoMode: UInt8
     switch options.mode {
