@@ -22,6 +22,8 @@ jobs:
         run: swift build -v
       - name: Test
         run: swift test -v
+      - name: Benchmark
+        run: swift run -c release SwiftMP3Benchmark --seconds 10 --runs 3
 
   linux:
     name: Test (Linux)
@@ -35,6 +37,8 @@ jobs:
         run: swift build -v
       - name: Test
         run: swift test -v
+      - name: Benchmark
+        run: swift run -c release SwiftMP3Benchmark --seconds 10 --runs 3
 
   build:
     name: Build (${{ matrix.platform }})
