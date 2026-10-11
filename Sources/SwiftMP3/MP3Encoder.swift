@@ -238,7 +238,7 @@ public struct MP3Encoder: Sendable {
 
   /// Encodes each element of `input` with `feed` into a file at `url`, removing the file
   /// if anything throws.
-  func write<S: AsyncSequence & Sendable>(
+  func write<S: AsyncSequence>(
     _ input: S,
     to url: URL,
     feed: (inout EncoderSession, S.Element) throws -> Data

@@ -64,21 +64,13 @@ extension EncoderSession {
 }
 
 extension MP3Encoder {
-  /// Streaming encode of audio buffers: yields MP3 frames as `Data` chunks. No Xing
-  /// header is included.
-  ///
-  /// Each buffer must suit ``EncoderSession/encode(buffer:)``; the stream finishes with
-  /// ``MP3EncoderError/unsupportedBufferFormat(_:)`` at the first one that doesn't.
-  public func encode<S: AsyncSequence & Sendable>(
-    _ input: S
-  ) -> AsyncThrowingStream<Data, Error> where S.Element == AVAudioPCMBuffer {
-    stream(input) { session, buffer in try session.encode(buffer: buffer) }
-  }
-
   /// File encode of audio buffers: writes MP3 frames to disk with a Xing header, as the
   /// float-sample `encode(_:to:)` does. If encoding fails or is cancelled, the partly
   /// written file is removed.
-  public func encode<S: AsyncSequence & Sendable>(
+  ///
+  /// Each buffer must suit ``EncoderSession/encode(buffer:)``; encoding stops with
+  /// ``MP3EncoderError/unsupportedBufferFormat(_:)`` at the first one that doesn't.
+  public func encode<S: AsyncSequence>(
     _ input: S, to url: URL
   ) async throws where S.Element == AVAudioPCMBuffer {
     try await write(input, to: url) { session, buffer in try session.encode(buffer: buffer) }

@@ -376,3 +376,38 @@ func measuresLoudnessOfReferenceTone(sampleRate: Int) throws {
   _ = session.flush()
   #expect(session.replayGain == nil)
 }
+
+#if canImport(AVFAudio)
+/// Hands out audio buffers one at a time.
+private struct BufferSequence: AsyncSequence, AsyncIteratorProtocol {
+  var buffers: [AVAudioPCMBuffer]
+  mutating func next() async -> AVAudioPCMBuffer? {
+    buffers.isEmpty ? nil : buffers.removeFirst()
+  }
+  func makeAsyncIterator() -> BufferSequence { self }
+}
+
+@Test func audioBufferFileMatchesSession() async throws {
+  let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 44_100, channels: 2, interleaved: false)!
+  var buffers = [AVAudioPCMBuffer]()
+  for b in 0..<3 {
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_096)!
+    buffer.frameLength = 4_096
+    for i in 0..<4_096 {
+      buffer.floatChannelData![0][i] = Float(sin(Double(b * 4_096 + i) * 0.03)) * 0.5
+      buffer.floatChannelData![1][i] = Float(sin(Double(b * 4_096 + i) * 0.05)) * 0.3
+    }
+    buffers.append(buffer)
+  }
+  let encoder = try MP3Encoder(options: MP3EncoderOptions())
+  let url = FileManager.default.temporaryDirectory.appendingPathComponent("buffers_\(UUID().uuidString).mp3")
+  defer { try? FileManager.default.removeItem(at: url) }
+  try await encoder.encode(BufferSequence(buffers: buffers), to: url)
+
+  var session = encoder.newSession()
+  var expected = Data()
+  for buffer in buffers { expected.append(try session.encode(buffer: buffer)) }
+  expected.append(session.flush())
+  #expect(try Data(contentsOf: url) == session.generateXingHeader() + expected)
+}
+#endif
