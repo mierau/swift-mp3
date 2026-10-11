@@ -55,10 +55,12 @@ struct PsychoacousticModel {
       let db = 3.64 * pow(khz, -0.8) - 6.5 * exp(-0.6 * (khz - 3.3) * (khz - 3.3)) + 0.001 * pow(khz, 4)
       return min(db, 60)
     }
-    // A full-scale sine is taken to be 90 dB SPL. `fullScale` is the MDCT energy
-    // of a full-scale sine in one line for long and short blocks.
+    // `fullScale` is the MDCT energy of a full-scale sine in one line for long and short
+    // blocks. The playback level is unknown, so full scale is taken to be 140 dB SPL: a
+    // threshold calibrated for 90 dB zeroed the 8-16 kHz bands of quiet recordings, which
+    // listeners hear as dullness and which cost ViSQOL more than the bits it saved.
     func athEnergy(_ f: Double, fullScale: Double) -> Double {
-      fullScale * pow(10, (athDB(f) - 90) / 10)
+      fullScale * pow(10, (athDB(f) - Self.fullScaleSPL) / 10)
     }
 
     func tables(bands: [Int], lines: Int, fullScale: Double) -> (ath: [Float], spreading: [Float], bark: [Float]) {
@@ -78,7 +80,11 @@ struct PsychoacousticModel {
       var spreading = [Float](repeating: 0, count: count * count)
       for maskee in 0..<count {
         for masker in 0..<count {
-          let dz = Double(barks[maskee] - barks[masker]) + 0.474
+          // Masking spreads upward in frequency further than Schroeder's function says;
+          // stretching its upper slope by 1/0.6 measured better on ViSQOL.
+          var dz = Double(barks[maskee] - barks[masker])
+          if dz > 0 { dz *= 0.6 }
+          dz += 0.474
           let db = 15.81 + 7.5 * dz - 17.5 * (1 + dz * dz).squareRoot()
           spreading[maskee * count + masker] = db < -60 ? 0 : Float(pow(10, db / 10))
         }
@@ -99,6 +105,10 @@ struct PsychoacousticModel {
   /// Approximate MDCT energy of a full-scale sine, concentrated in one band.
   static let fullScaleLong: Double = 1
   static let fullScaleShort: Double = 1
+
+  /// Sound pressure level, in dB, taken for a full-scale sine when placing the absolute
+  /// threshold of hearing.
+  static let fullScaleSPL: Double = 140
 
   /// Computes masking for a long-block (normal, start, or stop) granule.
   ///
@@ -163,8 +173,10 @@ struct PsychoacousticModel {
 
   /// Energy and masking offset of one band.
   ///
-  /// The offset is the signal-to-mask ratio for a masker of this band: 6 dB
-  /// for noise and 14.5 + Bark dB (at least 29 dB) for a pure tone, interpolated by spectral flatness.
+  /// The offset is the signal-to-mask ratio for a masker of this band: 6 dB for noise and
+  /// the band's Bark value in dB (at least 12 dB) for a pure tone, interpolated by spectral
+  /// flatness. The textbook tone offset (14.5 + Bark, at least 29 dB) spent so many bits on
+  /// low tonal bands that high bands were starved.
   @inline(__always)
   private func bandStatistics(_ x: UnsafePointer<Float>, logs: [Float], from start: Int, to end: Int, bark: Float) -> (Float, Float) {
     var sum: Float = 0
@@ -186,7 +198,7 @@ struct PsychoacousticModel {
     // Spectral flatness in dB: 0 for white noise, strongly negative for a tone.
     let flatness = 10 * 0.30103 * (logSum / n - log2(sum / n))
     let tonality = min(max(flatness / -6, 0), 1)
-    let offsetDB = tonality * max(29, 14.5 + bark) + (1 - tonality) * 6
+    let offsetDB = tonality * max(12, bark) + (1 - tonality) * 6
     return (sum, pow(10, -offsetDB / 10))
   }
 
