@@ -13,7 +13,8 @@ A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG Layer II
 - Mono, stereo, and joint stereo
 - Streaming encoding — feed samples incrementally
 - Async/await support with `AsyncSequence` input
-- File encoding with automatic Xing header
+- File encoding with automatic Xing header, from an async sequence or straight from an audio file, with progress
+- `mp3encode`, a small command-line encoder
 - Xing/Info and LAME tags for accurate seeking and gapless playback
 - ReplayGain 2.0 track gain and peak (ITU-R BS.1770 loudness) in the LAME tag
 - Float, 16-bit integer, planar, and `AVAudioPCMBuffer` input, with downmixing to mono
@@ -23,7 +24,7 @@ A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG Layer II
 - Mid/side stereo chosen per frame
 - ISO 11172-3 compliant Huffman coding and polyphase filterbank
 - Encodes 40-250x faster than realtime on one core, using Accelerate on Apple platforms and SIMD elsewhere
-- ID3v2.3 metadata tagging (title, artist, album, artwork, etc.)
+- ID3v2.3 metadata tagging (title, artist, album artist, composer, disc, lyrics, artwork, ReplayGain, etc.)
 - Fully `Sendable` — safe to use from any concurrency context
 
 ## Requirements
@@ -146,6 +147,29 @@ let encoder = try MP3Encoder(options: options)
 try await encoder.encode(sampleSource, to: outputURL)
 ```
 
+### Encoding a File
+
+`encode(contentsOf:to:progress:)` reads an audio file and writes the MP3, calling `progress` with the fraction done after each chunk. On Apple platforms it reads anything `AVAudioFile` does (WAV, AIFF, CAF, FLAC, M4A, ...); elsewhere it reads uncompressed WAV. The file's sample rate replaces `sampleRate`, and a mono file makes a mono MP3:
+
+```swift
+let encoder = try MP3Encoder(options: MP3EncoderOptions(bitrateKbps: 192))
+try await encoder.encode(contentsOf: wavURL, to: mp3URL) { fraction in
+  print("\(Int(fraction * 100))%")
+}
+```
+
+The `progress` closure is `@Sendable`; hop to the main actor to update UI from it.
+
+### Command Line
+
+`mp3encode` wraps the same call:
+
+```sh
+swift run -c release mp3encode input.wav output.mp3 -b 192 --title "My Song" --artist "Artist"
+```
+
+Run `mp3encode --help` for the bitrate, VBR, quality, mode, sample rate, and ID3 options.
+
 ### Metadata
 
 Embed ID3v2.3 tags (title, artist, album, artwork, etc.) in your MP3 files:
@@ -171,6 +195,8 @@ let options = MP3EncoderOptions(
   )
 )
 ```
+
+When the encoder writes a file (`encode(_:to:)` or `encode(contentsOf:to:)`), the ID3 tag also gets `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` frames, for players that read ReplayGain from ID3 rather than the LAME tag. With a session, call `generateID3Tag()` after `flush()` to include them.
 
 ### Live Microphone Recording
 
@@ -253,6 +279,7 @@ Stateless, `Sendable` encoder that holds configuration. Safe to share across tas
 | `newSession() -> EncoderSession` | Create a mutable encoding session for synchronous use |
 | `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of `[Float]` or `[Int16]` |
 | `encode(_:to:) async throws` | Encode an `AsyncSequence` of `[Float]`, `[Int16]`, or `AVAudioPCMBuffer` to a file with Xing header (includes ID3 tag if set) |
+| `encode(contentsOf:to:progress:) async throws` | Encode an audio file to an MP3 file, reporting progress |
 
 ### `EncoderSession`
 
@@ -265,7 +292,7 @@ Mutable encoding session created via `MP3Encoder.newSession()`. Not `Sendable` �
 | `encode(planar: [[Float]]) -> Data` | Feed one array of samples per channel |
 | `encode(buffer: AVAudioPCMBuffer) throws -> Data` | Feed an audio buffer (Apple platforms) |
 | `flush() -> Data` | Pads and encodes any remaining buffered samples |
-| `generateID3Tag() -> Data` | Generates the ID3v2.3 tag data (empty if no tag configured) |
+| `generateID3Tag() -> Data` | Generates the ID3v2.3 tag data (empty if no tag configured); after `flush()` it includes ReplayGain |
 | `generateXingHeader() -> Data` | Generates the Xing/Info frame with a LAME tag (call after encoding is complete) |
 | `encodedFrameCount: Int` | Number of MP3 frames encoded so far |
 | `encodedByteCount: Int` | Total bytes of encoded audio data so far |
@@ -282,17 +309,22 @@ Metadata for ID3v2.3 tags, embedded at the start of the MP3 file.
 | `title` | `String?` | `nil` | Track title (TIT2) |
 | `artist` | `String?` | `nil` | Artist name (TPE1) |
 | `album` | `String?` | `nil` | Album name (TALB) |
+| `albumArtist` | `String?` | `nil` | Album artist (TPE2) |
+| `composer` | `String?` | `nil` | Composer (TCOM) |
 | `track` | `UInt16?` | `nil` | Track number (TRCK) |
 | `trackTotal` | `UInt16?` | `nil` | Total tracks (TRCK denominator) |
+| `disc` | `UInt16?` | `nil` | Disc number (TPOS) |
+| `discTotal` | `UInt16?` | `nil` | Total discs (TPOS denominator) |
 | `year` | `UInt16?` | `nil` | Release year (TYER) |
 | `genre` | `String?` | `nil` | Genre name (TCON) |
 | `comment` | `String?` | `nil` | Comment (COMM) |
+| `lyrics` | `String?` | `nil` | Unsynchronized lyrics (USLT) |
 | `albumArt` | `Data?` | `nil` | Album artwork JPEG or PNG data (APIC) |
 | `albumArtMIMEType` | `String` | `"image/jpeg"` | MIME type for album artwork |
 
 ### Sample Format
 
-Input samples are interleaved `Float` values in the range `-1.0` to `1.0`:
+Input samples are interleaved `Float` values in the range `-1.0` to `1.0`. NaN and infinite samples are encoded as silence:
 
 - **Mono**: `[s0, s1, s2, ...]`
 - **Stereo / Joint Stereo**: `[L0, R0, L1, R1, L2, R2, ...]`
@@ -332,6 +364,7 @@ API documentation can be built locally in Xcode with **Product › Build Documen
 swift build
 swift test
 swift run -c release SwiftMP3Benchmark   # encode speed on synthetic signals
+swift run -c release mp3encode --help    # command-line encoder
 ```
 
 `SwiftMP3Benchmark --hashes` also prints a hash of each encode, to check that a change leaves the output byte-for-byte the same.
