@@ -28,6 +28,10 @@ struct LoudnessMeter {
 
   /// Adds interleaved samples.
   mutating func add(_ samples: ArraySlice<Float>) {
+    if channels == 2 && channel == 0 {
+      addStereo(samples)
+      return
+    }
     var ch = channel
     defer { channel = ch }
     for sample in samples {
@@ -44,6 +48,48 @@ struct LoudnessMeter {
           stepFill = 0
         }
       }
+    }
+  }
+
+  /// ``add(_:)`` for stereo starting on a left sample, filtering both channels of each
+  /// frame together so their filters run in parallel.
+  private mutating func addStereo(_ samples: ArraySlice<Float>) {
+    var left = filters[0]
+    var right = filters[1]
+    var peak = self.peak
+    var sum = stepSum
+    var fill = stepFill
+    let frames = samples.count / 2
+    samples.withUnsafeBufferPointer { samples in
+      for i in 0..<frames {
+        let l = samples[2 * i]
+        let r = samples[2 * i + 1]
+        peak = max(peak, abs(l))
+        peak = max(peak, abs(r))
+        let yl = left.process(Double(l))
+        let yr = right.process(Double(r))
+        sum += yl * yl
+        sum += yr * yr
+        fill += 1
+        if fill == stepLength {
+          steps.append(sum / Double(stepLength))
+          sum = 0
+          fill = 0
+        }
+      }
+    }
+    filters[0] = left
+    filters[1] = right
+    self.peak = peak
+    stepSum = sum
+    stepFill = fill
+    if samples.count % 2 == 1 {
+      // Finish with the odd left sample, leaving the next call to start on the right.
+      let sample = samples[samples.endIndex - 1]
+      self.peak = max(self.peak, abs(sample))
+      let y = filters[0].process(Double(sample))
+      stepSum += y * y
+      channel = 1
     }
   }
 

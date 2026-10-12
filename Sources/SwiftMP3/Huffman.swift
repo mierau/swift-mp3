@@ -17,15 +17,17 @@ extension FlatHuffmanTables {
     // Count the pairs in every table at once (at most 288 pairs of at most 19 bits per lane).
     var costs = SIMD16<UInt16>()
     var maxValue: Int32 = 0
-    var escapes = 0
     var i = begin
     while i < end {
       let x = ix[i]
       let y = ix[i + 1]
       maxValue = max(maxValue, x, y)
       costs &+= pairCosts[Int(min(x, 15)) * 16 + Int(min(y, 15))]
-      escapes += (x >= 15 ? 1 : 0) + (y >= 15 ? 1 : 0)
       i += 2
+    }
+    var escapes = 0
+    if maxValue >= 15 {
+      for i in begin..<end where ix[i] >= 15 { escapes += 1 }
     }
     return cheapest(costs, maxValue: maxValue, escapes: escapes)
   }
