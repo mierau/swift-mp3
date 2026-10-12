@@ -411,3 +411,19 @@ private struct BufferSequence: AsyncSequence, AsyncIteratorProtocol {
   #expect(try Data(contentsOf: url) == session.generateXingHeader() + expected)
 }
 #endif
+
+@Test(arguments: [Float.nan, .infinity, -.infinity, 1e30])
+func nonFiniteInputIsSilenced(bad: Float) throws {
+  for vbr in [false, true] {
+    let options = MP3EncoderOptions(sampleRate: 48_000, outputSampleRate: 44_100, vbr: vbr, mode: .jointStereo)
+    var session = try MP3Encoder(options: options).newSession()
+    var input = sine(1_000, rate: 48_000, count: 48_000, channels: 2).map { $0 * 0.5 }
+    for i in stride(from: 1_000, to: input.count, by: 7_919) { input[i] = bad }
+    var data = session.encode(samples: input)
+    data.append(session.flush())
+    data = session.generateXingHeader() + data
+    #expect(parseFrames(data) != nil)
+    #expect(session.peakAmplitude.isFinite)
+    #expect(session.replayGain?.isFinite == true)
+  }
+}

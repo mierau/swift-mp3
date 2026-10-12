@@ -214,10 +214,12 @@ public struct EncoderSession {
     let before = pcm.count
     if resampler == nil {
       body(&pcm)
+      pcm.withUnsafeMutableBufferPointer { Self.sanitize(UnsafeMutableBufferPointer(rebasing: $0[before...])) }
     } else {
       var input = [Float]()
       input.reserveCapacity(count)
       body(&input)
+      input.withUnsafeMutableBufferPointer { Self.sanitize($0) }
       input.withUnsafeBufferPointer { resampler!.process($0, into: &pcm) }
     }
     inputSamples += pcm.count - before
@@ -225,6 +227,19 @@ public struct EncoderSession {
     var output: [UInt8] = []
     processBufferedInput(into: &output)
     return Data(output)
+  }
+
+  /// Largest sample magnitude passed to the encoder, far above full scale but low enough
+  /// that no energy or gain computed from it overflows.
+  static let sampleLimit: Float = 1_024
+
+  /// Replaces NaN and infinite samples with silence and clamps the rest to
+  /// ±``sampleLimit``, since one bad sample would otherwise poison the filterbank state.
+  private static func sanitize(_ samples: UnsafeMutableBufferPointer<Float>) {
+    for i in samples.indices {
+      let x = samples[i]
+      samples[i] = x.isFinite ? min(max(x, -sampleLimit), sampleLimit) : 0
+    }
   }
 
   /// Encodes any remaining buffered samples and emits all pending frames.
