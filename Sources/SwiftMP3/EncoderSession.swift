@@ -41,6 +41,8 @@ public struct EncoderSession {
   private let lowpassHz: Int
   private let lowpassLong: Int
   private let lowpassShort: Int
+  /// First long-block scalefactor band coded with intensity stereo, or `nil` for none.
+  private let intensityBand: Int?
 
   // Granules awaiting a frame: [granule][channel]
   private var spectra: [[[Float]]]
@@ -136,6 +138,12 @@ public struct EncoderSession {
     lowpassHz = Int(cutoff.rounded())
     lowpassLong = min(576, Int((cutoff / (Double(sampleRate) / 2) * 576).rounded()))
     lowpassShort = min(192, Int((cutoff / (Double(sampleRate) / 2) * 192).rounded()))
+    if let start = Self.intensityStartFrequency(kbps: options.bitrateKbps), format.isMPEG1, options.mode == .jointStereo {
+      let line = Int((start / (Double(sampleRate) / 2) * 576).rounded())
+      intensityBand = min(format.longBands.firstIndex { $0 >= line } ?? 21, 21)
+    } else {
+      intensityBand = nil
+    }
 
     loudness = LoudnessMeter(sampleRate: format.sampleRate, channels: channels)
     psychoacoustics = PsychoacousticModel(format: format, quality: options.quality)
@@ -214,10 +222,12 @@ public struct EncoderSession {
     let before = pcm.count
     if resampler == nil {
       body(&pcm)
+      pcm.withUnsafeMutableBufferPointer { Self.sanitize(UnsafeMutableBufferPointer(rebasing: $0[before...])) }
     } else {
       var input = [Float]()
       input.reserveCapacity(count)
       body(&input)
+      input.withUnsafeMutableBufferPointer { Self.sanitize($0) }
       input.withUnsafeBufferPointer { resampler!.process($0, into: &pcm) }
     }
     inputSamples += pcm.count - before
@@ -225,6 +235,19 @@ public struct EncoderSession {
     var output: [UInt8] = []
     processBufferedInput(into: &output)
     return Data(output)
+  }
+
+  /// Largest sample magnitude passed to the encoder, far above full scale but low enough
+  /// that no energy or gain computed from it overflows.
+  static let sampleLimit: Float = 1_024
+
+  /// Replaces NaN and infinite samples with silence and clamps the rest to
+  /// ±``sampleLimit``, since one bad sample would otherwise poison the filterbank state.
+  private static func sanitize(_ samples: UnsafeMutableBufferPointer<Float>) {
+    for i in samples.indices {
+      let x = samples[i]
+      samples[i] = x.isFinite ? min(max(x, -sampleLimit), sampleLimit) : 0
+    }
   }
 
   /// Encodes any remaining buffered samples and emits all pending frames.
@@ -275,10 +298,19 @@ public struct EncoderSession {
 
   /// Generates the ID3v2.3 tag data for the configured metadata.
   ///
+  /// Called after ``flush()``, the tag also carries the track's ReplayGain as
+  /// `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` frames, for players that read
+  /// them from ID3 rather than the LAME tag.
+  ///
   /// Returns empty `Data` if no ID3 tag is configured or all fields are empty.
   public func generateID3Tag() -> Data {
     guard let tag = options.id3Tag else { return Data() }
-    return ID3TagWriter.build(tag: tag)
+    return ID3TagWriter.build(tag: tag, replayGain: finished ? id3ReplayGain : nil)
+  }
+
+  /// The ReplayGain to write to the ID3 tag, once there's enough audio to measure.
+  var id3ReplayGain: ID3TagWriter.ReplayGain? {
+    replayGain.map { ID3TagWriter.ReplayGain(gain: $0, peak: peakAmplitude) }
   }
 
   // MARK: - Analysis
@@ -431,10 +463,17 @@ public struct EncoderSession {
       masking.append(row)
     }
 
+    // Intensity stereo: above `intensityBand`, code only the left channel and the
+    // right channel's share of each band. Short blocks keep full stereo.
+    var intensity: (band: Int, positions: [[Int]])?
+    if let band = intensityBand, blockTypes[..<granules].allSatisfy({ !$0.contains(.short) }) {
+      intensity = (band, applyIntensityStereo(from: band, &masking))
+    }
+
     var useMidSide = false
     var sideRatio = [Float](repeating: 0.5, count: granules)
     if options.mode == .jointStereo {
-      (useMidSide, sideRatio) = decideMidSide(&masking)
+      (useMidSide, sideRatio) = decideMidSide(&masking, intensityBand: intensity?.band)
     }
 
     // Bitrate and frame size.
@@ -451,12 +490,16 @@ public struct EncoderSession {
       for gr in 0..<granules {
         var row = [GranuleInfo]()
         for ch in 0..<channels {
-          let info = spectra[gr][ch].withUnsafeBufferPointer { spectrum in
+          quantizer.allowsPreflag = intensity == nil || ch == 0
+          var info = spectra[gr][ch].withUnsafeBufferPointer { spectrum in
             quantizer.quantizeTransparent(
               spectrum: spectrum.baseAddress!,
               blockType: blockTypes[gr][ch],
               allowedNoise: masking[gr][ch].allowedNoise
             )
+          }
+          if let intensity, ch == 1, info != nil {
+            Self.writeIntensityPositions(&info!, positions: intensity.positions[gr], from: intensity.band, format: format)
           }
           if let info {
             row.append(info)
@@ -513,13 +556,19 @@ public struct EncoderSession {
         )
         var row = [GranuleInfo]()
         for ch in 0..<channels {
-          let info = spectra[gr][ch].withUnsafeBufferPointer { spectrum in
+          quantizer.allowsPreflag = intensity == nil || ch == 0
+          // Writing intensity positions can add up to 74 scalefactor bits.
+          let maxBits = intensity != nil && ch == 1 ? max(0, targets[ch] - 74) : targets[ch]
+          var info = spectra[gr][ch].withUnsafeBufferPointer { spectrum in
             quantizer.quantize(
               spectrum: spectrum.baseAddress!,
               blockType: blockTypes[gr][ch],
               allowedNoise: masking[gr][ch].allowedNoise,
-              maxBits: targets[ch]
+              maxBits: maxBits
             )
+          }
+          if let intensity, ch == 1 {
+            Self.writeIntensityPositions(&info, positions: intensity.positions[gr], from: intensity.band, format: format)
           }
           reservoir -= info.part23Length
           usedBits += info.part23Length
@@ -570,6 +619,7 @@ public struct EncoderSession {
       bitrateIndex: bitrateIndex,
       padding: padding,
       midSide: useMidSide,
+      intensity: intensity != nil,
       granules: coded,
       scfsi: scfsi,
       mainDataBegin: mainDataBegin
@@ -592,7 +642,10 @@ public struct EncoderSession {
 
   /// Converts the frame to mid/side when that needs fewer bits. Returns whether it did,
   /// and each granule's share of energy in the side channel.
-  private mutating func decideMidSide(_ masking: inout [[MaskingResult]]) -> (Bool, [Float]) {
+  ///
+  /// From `intensityBand` up, the left channel already carries both channels and the right
+  /// channel is silent, so those bands stay as they are.
+  private mutating func decideMidSide(_ masking: inout [[MaskingResult]], intensityBand: Int?) -> (Bool, [Float]) {
     let granules = format.granules
     guard (0..<granules).allSatisfy({ blockTypes[$0][0] == blockTypes[$0][1] }) else {
       return (false, [Float](repeating: 0.5, count: granules))
@@ -604,12 +657,13 @@ public struct EncoderSession {
     var ratios = [Float]()
     var entropyLR: Float = 0
     var entropyMS: Float = 0
+    let limit = intensityBand.map { format.longBands[$0] } ?? 576
     for gr in 0..<granules {
-      var m = [Float](repeating: 0, count: 576)
-      var s = [Float](repeating: 0, count: 576)
+      var m = spectra[gr][0]
+      var s = spectra[gr][1]
       var midEnergy: Float = 0
       var sideEnergy: Float = 0
-      for i in 0..<576 {
+      for i in 0..<limit {
         let l = spectra[gr][0][i]
         let r = spectra[gr][1][i]
         m[i] = (l + r) * scale
@@ -622,15 +676,11 @@ public struct EncoderSession {
       // Mid and side share the stricter of the left and right thresholds.
       let left = masking[gr][0]
       let right = masking[gr][1]
-      let allowed = zip(left.allowedNoise, right.allowedNoise).map { min($0, $1) }
-      let ms = [m, s].map { channel -> MaskingResult in
-        let energy = Self.bandEnergies(channel, like: left.energy.count, psychoacoustics)
-        var pe: Float = 0
-        for b in 0..<energy.count where energy[b] > allowed[b] {
-          pe += Float(Self.bandWidth(b, count: energy.count, psychoacoustics)) * 0.5 * log2(energy[b] / allowed[b])
-        }
-        return MaskingResult(allowedNoise: allowed, energy: energy, perceptualEntropy: pe)
+      var allowed = zip(left.allowedNoise, right.allowedNoise).map { min($0, $1) }
+      if let intensityBand {
+        allowed.replaceSubrange(intensityBand..., with: left.allowedNoise[intensityBand...])
       }
+      let ms = [m, s].map { Self.masking($0, allowedNoise: allowed, psychoacoustics) }
       entropyLR += left.perceptualEntropy + right.perceptualEntropy
       entropyMS += ms[0].perceptualEntropy + ms[1].perceptualEntropy
       mid.append(m)
@@ -644,6 +694,136 @@ public struct EncoderSession {
     }
     masking = midSideMasking
     return (true, ratios)
+  }
+
+  /// Masking result of `spectrum` under `allowedNoise`, with its energy and perceptual entropy.
+  private static func masking(_ spectrum: [Float], allowedNoise: [Float], _ model: PsychoacousticModel) -> MaskingResult {
+    let energy = bandEnergies(spectrum, like: allowedNoise.count, model)
+    var pe: Float = 0
+    for b in 0..<energy.count where energy[b] > allowedNoise[b] {
+      pe += Float(bandWidth(b, count: energy.count, model)) * 0.5 * log2(energy[b] / allowedNoise[b])
+    }
+    return MaskingResult(allowedNoise: allowedNoise, energy: energy, perceptualEntropy: pe)
+  }
+
+  // MARK: - Intensity stereo
+
+  /// The frequency joint stereo starts intensity stereo at, by bitrate. On ViSQOL's
+  /// conformance clips it raised the score of each channel and of the mono downmix at 64
+  /// and 80 kbps; at 96 kbps it traded the downmix for the channels, so it stops there.
+  static func intensityStartFrequency(kbps: Int) -> Double? {
+    switch kbps {
+    case ...64: return 6_000
+    case ...80: return 10_000
+    default: return nil
+    }
+  }
+
+  /// Codes long-block bands from `band` up as intensity stereo: the left channel carries
+  /// a downmix of both channels and the right channel is cleared. Returns
+  /// each granule's intensity positions (`is_pos`, 0 to 6) by band.
+  ///
+  /// A decoder rebuilds the bands as L = x·k/(1+k) and R = x/(1+k), with k = tan(is_pos·π/12)
+  /// (ISO/IEC 11172-3, 2.4.3.4.9.3).
+  private mutating func applyIntensityStereo(from band: Int, _ masking: inout [[MaskingResult]]) -> [[Int]] {
+    let bands = format.longBands
+    var positions = [[Int]]()
+    for gr in 0..<format.granules {
+      var left = spectra[gr][0]
+      var right = spectra[gr][1]
+      var allowed = masking[gr][0].allowedNoise
+      var granulePositions = [Int](repeating: 0, count: 22)
+      for b in band..<21 {
+        let lines = bands[b]..<bands[b + 1]
+        var energyL: Float = 0
+        var energyR: Float = 0
+        var correlation: Float = 0
+        for i in lines {
+          energyL += left[i] * left[i]
+          energyR += right[i] * right[i]
+          correlation += left[i] * right[i]
+        }
+        let position = Int((atan2(energyL.squareRoot(), energyR.squareRoot()) * 12 / .pi).rounded())
+        granulePositions[b] = position
+        let k = Float(tan(Double(position) * .pi / 12))
+
+        // Downmix in phase with the louder of the two, scaled halfway (in dB) from the plain
+        // sum toward keeping each channel's energy, and by no more than 6 dB where the
+        // channels cancel. Keeping the energy flatters each channel but makes the mono
+        // downmix louder than the sum; halfway scored best on both.
+        let sign: Float = correlation < 0 ? -1 : 1
+        var energyX: Float = 0
+        for i in lines {
+          let x = left[i] + sign * right[i]
+          left[i] = x
+          energyX += x * x
+        }
+        let target: Float
+        if position == 6 {
+          target = energyL + energyR
+        } else {
+          target = (energyL + energyR) * (1 + k) * (1 + k) / (1 + k * k)
+        }
+        let gain = energyX > 0 ? min((target / energyX).squareRoot().squareRoot(), 2) : 0
+        for i in lines {
+          left[i] *= gain
+          right[i] = 0
+        }
+
+        // Noise in the downmix reaches the left channel scaled by k/(1+k) and the right
+        // by 1/(1+k); allow what keeps both under their thresholds.
+        let toLeft = position == 6 ? 1 : k / (1 + k)
+        let toRight = position == 6 ? 0 : 1 / (1 + k)
+        var limit = Float.infinity
+        if toLeft > 0 { limit = min(limit, masking[gr][0].allowedNoise[b] / (toLeft * toLeft)) }
+        if toRight > 0 { limit = min(limit, masking[gr][1].allowedNoise[b] / (toRight * toRight)) }
+        allowed[b] = limit
+      }
+      // Decoders disagree on the position for band 21, which has no scalefactor, so it
+      // is left empty.
+      for i in bands[21]..<576 {
+        left[i] = 0
+        right[i] = 0
+      }
+      spectra[gr][0] = left
+      spectra[gr][1] = right
+      masking[gr][0] = Self.masking(left, allowedNoise: allowed, psychoacoustics)
+      masking[gr][1] = Self.masking(right, allowedNoise: masking[gr][1].allowedNoise, psychoacoustics)
+      positions.append(granulePositions)
+    }
+    return positions
+  }
+
+  /// Writes intensity positions into the right channel's scalefactors and recounts its
+  /// scalefactor bits. The decoder's intensity region starts above the last nonzero line,
+  /// which may be below `band`; bands in between get the illegal position 7, which
+  /// decodes them as ordinary stereo.
+  private static func writeIntensityPositions(
+    _ info: inout GranuleInfo, positions: [Int], from band: Int, format: StreamFormat
+  ) {
+    let bands = format.longBands
+    let last = info.quantized.lastIndex { $0 != 0 }
+    let start = last.map { line in bands.lastIndex { $0 <= line }! + 1 } ?? 0
+    for b in start..<21 {
+      info.scalefactors[b] = b >= band ? positions[b] : 7
+    }
+    var max1 = 0
+    var max2 = 0
+    for b in 0..<21 {
+      if b < 11 { max1 = max(max1, info.scalefactors[b]) } else { max2 = max(max2, info.scalefactors[b]) }
+    }
+    var bestIndex = 0
+    var bestBits = Int.max
+    for (index, (slen1, slen2)) in MPEG.slen.enumerated() where max1 < (1 << slen1) && max2 < (1 << slen2) {
+      let bits = 11 * slen1 + 10 * slen2
+      if bits < bestBits {
+        bestBits = bits
+        bestIndex = index
+      }
+    }
+    info.part23Length += bestBits - info.part2Length
+    info.part2Length = bestBits
+    info.scalefacCompress = bestIndex
   }
 
   private static func bandEnergies(_ x: [Float], like count: Int, _ model: PsychoacousticModel) -> [Float] {
@@ -807,11 +987,14 @@ public struct EncoderSession {
     bitrateIndex: Int,
     padding: Bool,
     midSide: Bool,
+    intensity: Bool,
     granules: [[GranuleInfo]],
     scfsi: [[Int]],
     mainDataBegin: Int
   ) -> [UInt8] {
-    var bytes = headerBytes(bitrateIndex: bitrateIndex, padding: padding, crc: options.crcProtected, midSide: midSide)
+    var bytes = headerBytes(
+      bitrateIndex: bitrateIndex, padding: padding, crc: options.crcProtected, midSide: midSide, intensity: intensity
+    )
 
     let mpeg1 = format.isMPEG1
     var side = BitWriter(capacity: format.sideInfoSize)
@@ -868,7 +1051,7 @@ public struct EncoderSession {
   }
 
   /// The four-byte frame header.
-  private func headerBytes(bitrateIndex: Int, padding: Bool, crc: Bool, midSide: Bool) -> [UInt8] {
+  private func headerBytes(bitrateIndex: Int, padding: Bool, crc: Bool, midSide: Bool, intensity: Bool = false) -> [UInt8] {
     var header = BitWriter(capacity: 4)
     header.write(0x7FF, 11)
     header.write(format.version.headerBits, 2)
@@ -885,7 +1068,7 @@ public struct EncoderSession {
     case .stereo: modeBits = 0b00
     }
     header.write(modeBits, 2)
-    header.write(midSide ? 0b10 : 0b00, 2)
+    header.write((midSide ? 0b10 : 0) | (intensity ? 0b01 : 0), 2)
     header.write(options.copyright ? 1 : 0, 1)
     header.write(options.original ? 1 : 0, 1)
     header.write(0, 2)  // No emphasis

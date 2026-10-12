@@ -6,7 +6,7 @@ Encode PCM audio to MP3 in pure Swift.
 
 SwiftMP3 is an MPEG Layer III encoder written entirely in Swift with no dependencies. It supports MPEG-1, MPEG-2, and MPEG-2.5 sample rates (resampling input at any other rate), CBR and VBR encoding, mono, stereo, and joint stereo, ID3v2.3 metadata, and Xing/Info and LAME tags for accurate seeking, gapless playback, and ReplayGain.
 
-Create an ``MP3Encoder`` with a set of ``MP3EncoderOptions``, then encode synchronously with an ``EncoderSession``, or asynchronously from any `AsyncSequence` of sample buffers.
+Create an ``MP3Encoder`` with a set of ``MP3EncoderOptions``, then encode synchronously with an ``EncoderSession``, or asynchronously from any `AsyncSequence` of sample buffers or straight from an audio file with ``MP3Encoder/encode(contentsOf:to:progress:)``.
 
 ```swift
 import SwiftMP3
@@ -22,7 +22,7 @@ try await encoder.encode(samples, to: outputURL)
 
 ### Sample Format
 
-Input samples are interleaved `Float` values in the range `-1.0` to `1.0`:
+Input samples are interleaved `Float` values in the range `-1.0` to `1.0`. NaN and infinite samples are encoded as silence:
 
 - **Mono**: `[s0, s1, s2, ...]`
 - **Stereo / Joint Stereo**: `[L0, R0, L1, R1, ...]`

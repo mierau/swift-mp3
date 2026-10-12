@@ -377,3 +377,66 @@ func resampledEncodeIsGapless() throws {
   }
   #expect((-32...32).max { correlation($0) < correlation($1) } == 0)
 }
+
+/// Interleaved stereo with a cluster of tones in 10.5-11.5 kHz, inside the intensity
+/// stereo region and below the lowpass at 64 kbps, at `left` and `right` times the same level.
+private func pannedTones(sampleRate: Int, seconds: Double, left: Float, right: Float) -> [Float] {
+  var random = SplitMix64(seed: 7)
+  var tones: [(frequency: Float, phase: Float)] = []
+  for k in 0..<24 {
+    let phase = Float(random.next() % 1_000) / 1_000 * 2 * Float.pi
+    tones.append((10_500 + Float(k) * 1_000 / 24, phase))
+  }
+  var output = [Float]()
+  for i in 0..<Int(Double(sampleRate) * seconds) {
+    let t = Float(i) / Float(sampleRate)
+    var value: Float = 0
+    for tone in tones { value += sin(2 * .pi * tone.frequency * t + tone.phase) * 0.03 }
+    output.append(value * left)
+    output.append(value * right)
+  }
+  return output
+}
+
+/// Frames whose mode extension turns on intensity stereo.
+private func intensityFrames(_ data: Data) -> (intensity: Int, total: Int) {
+  let bytes = [UInt8](data)
+  var intensity = 0
+  var total = 0
+  var offset = 0
+  for frame in parseFrames(data) ?? [] {
+    if bytes[offset + 3] >> 6 == 0b01 && (bytes[offset + 3] >> 4) & 1 == 1 { intensity += 1 }
+    total += 1
+    offset += frame.length
+  }
+  return (intensity, total)
+}
+
+@Test(.enabled(if: TestDecoder.isAvailable), arguments: [64, 80])
+func intensityStereoKeepsPanning(bitrate: Int) throws {
+  let input = pannedTones(sampleRate: 44_100, seconds: 2, left: 1, right: 0.33)
+  let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: bitrate, mode: .jointStereo)
+  let data = try encodeFile(input, options: options)
+  let frames = intensityFrames(data)
+  #expect(frames.intensity > frames.total / 2)
+
+  // The level difference between channels survives within the 15° steps of the
+  // intensity position, and the total level within 1.5 dB.
+  let decoded = try TestDecoder.decode(data).channels
+  func energy(_ x: [Float]) -> Double {
+    x[4_410..<70_560].reduce(0) { $0 + Double($1) * Double($1) }
+  }
+  let original = (0..<2).map { ch in energy(stride(from: ch, to: input.count, by: 2).map { input[$0] }) }
+  let coded = decoded.map(energy)
+  let originalDifference = 10 * log10(original[0] / original[1])
+  let codedDifference = 10 * log10(coded[0] / coded[1])
+  #expect(abs(codedDifference - originalDifference) < 2.5)
+  #expect(abs(10 * log10((coded[0] + coded[1]) / (original[0] + original[1]))) < 1.5)
+}
+
+@Test(arguments: [(96, MP3EncoderOptions.Mode.jointStereo), (128, .jointStereo), (64, .stereo)])
+func intensityStereoIsOffAboveLowBitratesAndOutsideJointStereo(bitrate: Int, mode: MP3EncoderOptions.Mode) throws {
+  let input = pannedTones(sampleRate: 44_100, seconds: 1, left: 1, right: 0.33)
+  let data = try encodeFile(input, options: MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: bitrate, mode: mode))
+  #expect(intensityFrames(data).intensity == 0)
+}
