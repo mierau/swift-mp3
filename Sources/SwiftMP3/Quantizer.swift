@@ -144,6 +144,9 @@ struct Quantizer {
 
   /// Whether scalefactors use the MPEG-2 coding (`scalefac_compress` with nine bits).
   private let lsf: Bool
+  /// Whether granules may use pre-emphasis. Off for an intensity-stereo right channel,
+  /// whose scalefactors carry intensity positions instead.
+  var allowsPreflag = true
 
   init(format: StreamFormat, quality: Int) {
     regions = RegionLayout(format: format)
@@ -181,6 +184,7 @@ struct Quantizer {
           layout: layout,
           regions: regions,
           lsf: lsf,
+          allowsPreflag: allowsPreflag,
           allowedNoise: allowedNoise
         )
         return work.run(
@@ -217,6 +221,7 @@ extension Quantizer {
           layout: layout,
           regions: regions,
           lsf: lsf,
+          allowsPreflag: allowsPreflag,
           allowedNoise: allowedNoise
         )
         return work.runTransparent(spectrum: spectrum, blockType: blockType, searchRegions: searchRegions)
@@ -235,6 +240,7 @@ private struct GranuleQuantization {
   let layout: BandLayout
   let regions: RegionLayout
   let lsf: Bool
+  let allowsPreflag: Bool
   let allowedNoise: [Float]
   let huffman = HuffmanTables.flat
   let tables = QuantTables.shared
@@ -255,6 +261,7 @@ private struct GranuleQuantization {
     layout: BandLayout,
     regions: RegionLayout,
     lsf: Bool,
+    allowsPreflag: Bool,
     allowedNoise: [Float]
   ) {
     self.xr34 = xr34
@@ -264,6 +271,7 @@ private struct GranuleQuantization {
     self.layout = layout
     self.regions = regions
     self.lsf = lsf
+    self.allowsPreflag = allowsPreflag
     self.allowedNoise = allowedNoise
     self.noise = [Float](repeating: 0, count: layout.count)
   }
@@ -820,7 +828,7 @@ private struct GranuleQuantization {
 
   /// Moves part of the high-band scalefactors into the pre-emphasis flag when that saves bits.
   func tryPreflag(_ info: inout GranuleInfo) {
-    guard !info.isShort, info.preflag == 0 else { return }
+    guard allowsPreflag, !info.isShort, info.preflag == 0 else { return }
     for band in 11..<21 where info.scalefactors[band] < layout.pretab[band] {
       return
     }
