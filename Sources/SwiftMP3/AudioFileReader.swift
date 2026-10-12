@@ -83,25 +83,30 @@ struct WAVReader: AudioFileReader {
         let header = try Self.read(handle, 8)
         guard header.count == 8 else { throw MP3EncoderError.unsupportedAudioFile("no data chunk") }
         let id = String(decoding: header[0..<4], as: UTF8.self)
-        let size = Self.uint32(header, 4)
+        let rawSize = Self.uint32(header, 4)
+        let size = Int(clamping: rawSize)
         if id == "data" {
           guard let format else { throw MP3EncoderError.unsupportedAudioFile("data chunk before fmt chunk") }
           // A streaming writer may leave the size at 0 or 0xFFFFFFFF.
-          remaining = size == 0 || size == 0xFFFF_FFFF ? nil : size
+          remaining = rawSize == 0 || rawSize == .max ? nil : size
           sampleRate = format.rate
           channelCount = format.channels
           blockAlign = format.blockAlign
           frameCount = remaining.map { $0 / format.blockAlign }
           break
         }
-        let body = try Self.read(handle, size + size % 2)
-        if id == "fmt " {
-          guard body.count >= 16 else { throw MP3EncoderError.unsupportedAudioFile("short fmt chunk") }
-          var tag = Self.uint16(body, 0)
-          // WAVE_FORMAT_EXTENSIBLE keeps the real format in the first two bytes of its GUID.
-          if tag == 0xFFFE, body.count >= 26 { tag = Self.uint16(body, 24) }
-          format = (tag, Self.uint16(body, 2), Self.uint32(body, 4), Self.uint16(body, 12), Self.uint16(body, 14))
+        // Chunks are padded to an even size.
+        let padded = UInt64(rawSize) + UInt64(rawSize % 2)
+        guard id == "fmt " else {
+          try handle.seek(toOffset: try handle.offset() + padded)
+          continue
         }
+        let body = try Self.read(handle, Int(clamping: padded))
+        guard body.count >= 16 else { throw MP3EncoderError.unsupportedAudioFile("short fmt chunk") }
+        var tag = Self.uint16(body, 0)
+        // WAVE_FORMAT_EXTENSIBLE keeps the real format in the first two bytes of its GUID.
+        if tag == 0xFFFE, body.count >= 26 { tag = Self.uint16(body, 24) }
+        format = (tag, Self.uint16(body, 2), Int(clamping: Self.uint32(body, 4)), Self.uint16(body, 12), Self.uint16(body, 14))
       }
       guard let format, format.channels > 0, format.rate > 0 else {
         throw MP3EncoderError.unsupportedAudioFile("no channels or sample rate")
@@ -174,8 +179,8 @@ struct WAVReader: AudioFileReader {
     Int(bytes[i]) | Int(bytes[i + 1]) << 8
   }
 
-  private static func uint32(_ bytes: [UInt8], _ i: Int) -> Int {
-    Int(bytes[i]) | Int(bytes[i + 1]) << 8 | Int(bytes[i + 2]) << 16 | Int(bytes[i + 3]) << 24
+  private static func uint32(_ bytes: [UInt8], _ i: Int) -> UInt32 {
+    UInt32(bytes[i]) | UInt32(bytes[i + 1]) << 8 | UInt32(bytes[i + 2]) << 16 | UInt32(bytes[i + 3]) << 24
   }
 }
 
