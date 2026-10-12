@@ -708,19 +708,19 @@ public struct EncoderSession {
 
   // MARK: - Intensity stereo
 
-  /// Bitrates at or below which joint stereo codes high bands with intensity stereo, and
-  /// the frequency it starts at.
+  /// The frequency joint stereo starts intensity stereo at, by bitrate. On ViSQOL's
+  /// conformance clips it raised the score of each channel and of the mono downmix at 64
+  /// and 80 kbps; at 96 kbps it traded the downmix for the channels, so it stops there.
   static func intensityStartFrequency(kbps: Int) -> Double? {
     switch kbps {
     case ...64: return 6_000
-    case ...80: return 8_000
-    case ...96: return 10_000
+    case ...80: return 10_000
     default: return nil
     }
   }
 
   /// Codes long-block bands from `band` up as intensity stereo: the left channel carries
-  /// a downmix with the energy of both channels and the right channel is cleared. Returns
+  /// a downmix of both channels and the right channel is cleared. Returns
   /// each granule's intensity positions (`is_pos`, 0 to 6) by band.
   ///
   /// A decoder rebuilds the bands as L = x·k/(1+k) and R = x/(1+k), with k = tan(is_pos·π/12)
@@ -747,8 +747,10 @@ public struct EncoderSession {
         granulePositions[b] = position
         let k = Float(tan(Double(position) * .pi / 12))
 
-        // Downmix in phase with the louder of the two, scaled to keep the total energy,
-        // but by no more than 6 dB where the channels cancel.
+        // Downmix in phase with the louder of the two, scaled halfway (in dB) from the plain
+        // sum toward keeping each channel's energy, and by no more than 6 dB where the
+        // channels cancel. Keeping the energy flatters each channel but makes the mono
+        // downmix louder than the sum; halfway scored best on both.
         let sign: Float = correlation < 0 ? -1 : 1
         var energyX: Float = 0
         for i in lines {
@@ -762,7 +764,7 @@ public struct EncoderSession {
         } else {
           target = (energyL + energyR) * (1 + k) * (1 + k) / (1 + k * k)
         }
-        let gain = energyX > 0 ? min((target / energyX).squareRoot(), 2) : 0
+        let gain = energyX > 0 ? min((target / energyX).squareRoot().squareRoot(), 2) : 0
         for i in lines {
           left[i] *= gain
           right[i] = 0

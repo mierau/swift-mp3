@@ -21,7 +21,7 @@ A pure Swift MP3 encoder with no dependencies. Encode PCM audio to MPEG Layer II
 - Psychoacoustic model (spreading, tonality, absolute threshold of hearing, pre-echo control)
 - Noise-shaping quantization with scalefactors, pre-emphasis, and scalefactor sharing
 - Transient detection with long/short block switching
-- Mid/side stereo chosen per frame
+- Mid/side stereo chosen per frame, and intensity stereo for the high bands at 80 kbps and below
 - ISO 11172-3 compliant Huffman coding and polyphase filterbank
 - Encodes 40-250x faster than realtime on one core, using Accelerate on Apple platforms and SIMD elsewhere
 - ID3v2.3 metadata tagging (title, artist, album artist, composer, disc, lyrics, artwork, ReplayGain, etc.)

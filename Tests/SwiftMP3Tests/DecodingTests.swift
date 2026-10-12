@@ -412,7 +412,7 @@ private func intensityFrames(_ data: Data) -> (intensity: Int, total: Int) {
   return (intensity, total)
 }
 
-@Test(.enabled(if: TestDecoder.isAvailable), arguments: [64, 96])
+@Test(.enabled(if: TestDecoder.isAvailable), arguments: [64, 80])
 func intensityStereoKeepsPanning(bitrate: Int) throws {
   let input = pannedTones(sampleRate: 44_100, seconds: 2, left: 1, right: 0.33)
   let options = MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: bitrate, mode: .jointStereo)
@@ -421,7 +421,7 @@ func intensityStereoKeepsPanning(bitrate: Int) throws {
   #expect(frames.intensity > frames.total / 2)
 
   // The level difference between channels survives within the 15° steps of the
-  // intensity position, and the total level within 1 dB.
+  // intensity position, and the total level within 1.5 dB.
   let decoded = try TestDecoder.decode(data).channels
   func energy(_ x: [Float]) -> Double {
     x[4_410..<70_560].reduce(0) { $0 + Double($1) * Double($1) }
@@ -431,10 +431,10 @@ func intensityStereoKeepsPanning(bitrate: Int) throws {
   let originalDifference = 10 * log10(original[0] / original[1])
   let codedDifference = 10 * log10(coded[0] / coded[1])
   #expect(abs(codedDifference - originalDifference) < 2.5)
-  #expect(abs(10 * log10((coded[0] + coded[1]) / (original[0] + original[1]))) < 1)
+  #expect(abs(10 * log10((coded[0] + coded[1]) / (original[0] + original[1]))) < 1.5)
 }
 
-@Test(arguments: [(128, MP3EncoderOptions.Mode.jointStereo), (64, .stereo)])
+@Test(arguments: [(96, MP3EncoderOptions.Mode.jointStereo), (128, .jointStereo), (64, .stereo)])
 func intensityStereoIsOffAboveLowBitratesAndOutsideJointStereo(bitrate: Int, mode: MP3EncoderOptions.Mode) throws {
   let input = pannedTones(sampleRate: 44_100, seconds: 1, left: 1, right: 0.33)
   let data = try encodeFile(input, options: MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: bitrate, mode: mode))
