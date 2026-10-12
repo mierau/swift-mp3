@@ -105,6 +105,8 @@ public enum MP3EncoderError: Error, Equatable, Sendable, CustomStringConvertible
   case invalidQuality(Int)
   /// An audio buffer's sample rate, channel count, or sample format doesn't match the encoder.
   case unsupportedBufferFormat(String)
+  /// An audio file can't be read, or its channels don't suit the encoder.
+  case unsupportedAudioFile(String)
 
   public var description: String {
     switch self {
@@ -117,6 +119,8 @@ public enum MP3EncoderError: Error, Equatable, Sendable, CustomStringConvertible
       return "Invalid quality \(quality); expected 0 through 9"
     case .unsupportedBufferFormat(let reason):
       return "Unsupported buffer format: \(reason)"
+    case .unsupportedAudioFile(let reason):
+      return "Unsupported audio file: \(reason)"
     }
   }
 }

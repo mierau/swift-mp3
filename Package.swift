@@ -25,6 +25,10 @@ let package = Package(
       name: "SwiftMP3Benchmark",
       dependencies: ["SwiftMP3"]
     ),
+    .executableTarget(
+      name: "mp3encode",
+      dependencies: ["SwiftMP3"]
+    ),
     .testTarget(
       name: "SwiftMP3Tests",
       dependencies: ["SwiftMP3"]
