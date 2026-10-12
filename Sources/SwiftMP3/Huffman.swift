@@ -14,54 +14,20 @@ extension FlatHuffmanTables {
   @inline(__always)
   func chooseTable(_ ix: UnsafePointer<Int32>, _ begin: Int, _ end: Int) -> (table: Int, bits: Int) {
     guard begin < end else { return (0, 0) }
+    // Count the pairs in every table at once (at most 288 pairs of at most 19 bits per lane).
+    var costs = SIMD16<UInt16>()
     var maxValue: Int32 = 0
-    for i in begin..<end where ix[i] > maxValue { maxValue = ix[i] }
-
-    switch maxValue {
-    case 0: return (0, 0)
-    case 1: return (1, count(ix, begin, end, table: 1))
-    case 2: return best(ix, begin, end, 2, 3)
-    case 3: return best(ix, begin, end, 5, 6)
-    case 4...5: return best(ix, begin, end, 7, 8, 9)
-    case 6...7: return best(ix, begin, end, 10, 11, 12)
-    case 8...15: return best(ix, begin, end, 13, 15)
-    default:
-      // Escape tables: the smallest of each family whose linbits cover the value.
-      var a = 16
-      while a < 23 && escapeMaxValues[a] < maxValue { a += 1 }
-      var b = 24
-      while b < 31 && escapeMaxValues[b] < maxValue { b += 1 }
-      let bitsA = count(ix, begin, end, table: a)
-      let bitsB = count(ix, begin, end, table: b)
-      return bitsA <= bitsB ? (a, bitsA) : (b, bitsB)
-    }
-  }
-
-  /// Counts two or three non-escape tables in one pass and returns the cheapest.
-  @inline(__always)
-  private func best(_ ix: UnsafePointer<Int32>, _ begin: Int, _ end: Int, _ t1: Int, _ t2: Int, _ t3: Int = -1) -> (Int, Int) {
-    let l1 = lengths + t1 * 256
-    let l2 = lengths + t2 * 256
-    let l3 = lengths + max(t3, 0) * 256
-    var b1 = 0
-    var b2 = 0
-    var b3 = 0
-    var signs = 0
+    var escapes = 0
     var i = begin
     while i < end {
-      let x = Int(ix[i])
-      let y = Int(ix[i + 1])
-      let index = x * 16 + y
-      b1 += Int(l1[index])
-      b2 += Int(l2[index])
-      b3 += Int(l3[index])
-      signs += (x != 0 ? 1 : 0) + (y != 0 ? 1 : 0)
+      let x = ix[i]
+      let y = ix[i + 1]
+      maxValue = max(maxValue, x, y)
+      costs &+= pairCosts[Int(min(x, 15)) * 16 + Int(min(y, 15))]
+      escapes += (x >= 15 ? 1 : 0) + (y >= 15 ? 1 : 0)
       i += 2
     }
-    var result = (t1, b1)
-    if b2 < result.1 { result = (t2, b2) }
-    if t3 >= 0 && b3 < result.1 { result = (t3, b3) }
-    return (result.0, result.1 + signs)
+    return cheapest(costs, maxValue: maxValue, escapes: escapes)
   }
 
   /// Bits needed to code the pairs in `[begin, end)` with `table`, including sign and escape bits.
@@ -113,20 +79,15 @@ extension FlatHuffmanTables {
 /// Huffman costs of a big-values region, summed per scalefactor band, so that the cost of
 /// any run of bands with any table is a difference of prefix sums.
 struct RegionCosts {
-  /// Non-escape tables, one cost column each.
-  private static let plainTables = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]
-  private static let escape16 = 13
-  private static let escape24 = 14
-  private static let signColumn = 15
-  private static let escapeColumn = 16
-  private static let columns = 17
-
   /// Largest value in each band.
   private var bandMax: [Int32]
   /// Line index of each band boundary, clipped to the end of the region.
   private var points: [Int]
-  /// Running sums at each boundary, `[point * columns + column]`.
-  private var prefix: [Int]
+  /// Running sums of ``FlatHuffmanTables/pairCosts`` at each boundary. A region has at
+  /// most 288 pairs of at most 19 bits, so the lanes can't overflow.
+  private var prefix: [SIMD16<UInt16>]
+  /// Running count of values that need escape bits (15 or more) at each boundary.
+  private var escapes: [Int]
   private let tables: FlatHuffmanTables
 
   init(_ ix: UnsafePointer<Int32>, end: Int, bands: [Int], tables: FlatHuffmanTables) {
@@ -134,9 +95,10 @@ struct RegionCosts {
     let count = bands.count
     points = bands.map { min($0, end) }
     bandMax = [Int32](repeating: 0, count: count)
-    prefix = [Int](repeating: 0, count: count * Self.columns)
-    let columns = Self.columns
-    var sums = [Int](repeating: 0, count: columns)
+    prefix = [SIMD16<UInt16>](repeating: .zero, count: count)
+    escapes = [Int](repeating: 0, count: count)
+    var sums = SIMD16<UInt16>()
+    var escapeSum = 0
     for k in 0..<(count - 1) {
       var maxValue: Int32 = 0
       var i = points[k]
@@ -144,31 +106,14 @@ struct RegionCosts {
         let x = ix[i]
         let y = ix[i + 1]
         maxValue = max(maxValue, x, y)
-        let index = Int(min(x, 15)) * 16 + Int(min(y, 15))
-        for (column, table) in Self.plainTables.enumerated() {
-          sums[column] += Int(tables.lengths[table * 256 + index])
-        }
-        sums[Self.escape16] += Int(tables.lengths[16 * 256 + index])
-        sums[Self.escape24] += Int(tables.lengths[24 * 256 + index])
-        sums[Self.signColumn] += (x != 0 ? 1 : 0) + (y != 0 ? 1 : 0)
-        sums[Self.escapeColumn] += (x >= 15 ? 1 : 0) + (y >= 15 ? 1 : 0)
+        sums &+= tables.pairCosts[Int(min(x, 15)) * 16 + Int(min(y, 15))]
+        escapeSum += (x >= 15 ? 1 : 0) + (y >= 15 ? 1 : 0)
         i += 2
       }
       bandMax[k] = maxValue
-      for column in 0..<columns {
-        prefix[(k + 1) * columns + column] = sums[column]
-      }
+      prefix[k + 1] = sums
+      escapes[k + 1] = escapeSum
     }
-  }
-
-  @inline(__always)
-  private func sum(_ column: Int, _ from: Int, _ to: Int) -> Int {
-    prefix[to * Self.columns + column] - prefix[from * Self.columns + column]
-  }
-
-  @inline(__always)
-  private func plain(_ table: Int, _ from: Int, _ to: Int) -> Int {
-    sum(Self.plainTables.firstIndex(of: table)!, from, to)
   }
 
   /// The same choice as ``FlatHuffmanTables/chooseTable(_:_:_:)`` for the lines between
@@ -177,33 +122,41 @@ struct RegionCosts {
     guard points[from] < points[to] else { return (0, 0) }
     var maxValue: Int32 = 0
     for k in from..<to { maxValue = max(maxValue, bandMax[k]) }
-    let signs = sum(Self.signColumn, from, to)
+    return tables.cheapest(prefix[to] &- prefix[from], maxValue: maxValue, escapes: escapes[to] - escapes[from])
+  }
+}
 
-    func best(_ candidates: [Int]) -> (Int, Int) {
-      var result = (candidates[0], plain(candidates[0], from, to))
-      for table in candidates.dropFirst() {
-        let bits = plain(table, from, to)
-        if bits < result.1 { result = (table, bits) }
-      }
-      return (result.0, result.1 + signs)
+extension FlatHuffmanTables {
+  /// The cheapest table for pairs whose costs sum to `costs` (lanes of ``pairCosts``),
+  /// with the same choice and tie-breaking as ``chooseTable(_:_:_:)``.
+  @inline(__always)
+  func cheapest(_ costs: SIMD16<UInt16>, maxValue: Int32, escapes: Int) -> (table: Int, bits: Int) {
+    @inline(__always)
+    func bits(_ table: Int) -> Int { Int(costs[Self.lane(of: table)]) }
+    @inline(__always)
+    func best(_ t1: Int, _ t2: Int, _ t3: Int = -1) -> (Int, Int) {
+      var result = (t1, bits(t1))
+      if bits(t2) < result.1 { result = (t2, bits(t2)) }
+      if t3 >= 0 && bits(t3) < result.1 { result = (t3, bits(t3)) }
+      return (result.0, result.1 + Int(costs[Self.signLane]))
     }
 
     switch maxValue {
     case 0: return (0, 0)
-    case 1: return (1, plain(1, from, to) + signs)
-    case 2: return best([2, 3])
-    case 3: return best([5, 6])
-    case 4...5: return best([7, 8, 9])
-    case 6...7: return best([10, 11, 12])
-    case 8...15: return best([13, 15])
+    case 1: return (1, bits(1) + Int(costs[Self.signLane]))
+    case 2: return best(2, 3)
+    case 3: return best(5, 6)
+    case 4...5: return best(7, 8, 9)
+    case 6...7: return best(10, 11, 12)
+    case 8...15: return best(13, 15)
     default:
       var a = 16
       while a < 23 && escapeMaxValues[a] < maxValue { a += 1 }
       var b = 24
       while b < 31 && escapeMaxValues[b] < maxValue { b += 1 }
-      let escapes = sum(Self.escapeColumn, from, to)
-      let bitsA = sum(Self.escape16, from, to) + signs + escapes * tables.linbits[a]
-      let bitsB = sum(Self.escape24, from, to) + signs + escapes * tables.linbits[b]
+      let signs = Int(costs[Self.signLane])
+      let bitsA = bits(16) + signs + escapes * linbits[a]
+      let bitsB = bits(24) + signs + escapes * linbits[b]
       return bitsA <= bitsB ? (a, bitsA) : (b, bitsB)
     }
   }
