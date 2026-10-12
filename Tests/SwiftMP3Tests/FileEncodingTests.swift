@@ -22,17 +22,34 @@ private func writeWAV(
       }
     }
   }
-  var fmt = le(extensible ? UInt16(0xFFFE) : formatTag) + le(UInt16(channels.count)) + le(UInt32(sampleRate))
-  fmt += le(UInt32(sampleRate * blockAlign)) + le(UInt16(blockAlign)) + le(UInt16(bits))
+  var fmt: [UInt8] = le(extensible ? UInt16(0xFFFE) : formatTag)
+  fmt += le(UInt16(channels.count))
+  fmt += le(UInt32(sampleRate))
+  fmt += le(UInt32(sampleRate * blockAlign))
+  fmt += le(UInt16(blockAlign))
+  fmt += le(UInt16(bits))
   if extensible {
     // cbSize, valid bits, channel mask, then the subformat GUID.
-    fmt += le(UInt16(22)) + le(UInt16(bits)) + le(UInt32(0))
-    fmt += le(formatTag) + [0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]
+    fmt += le(UInt16(22))
+    fmt += le(UInt16(bits))
+    fmt += le(UInt32(0))
+    fmt += le(formatTag)
+    let guid: [UInt8] = [0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]
+    fmt += guid
   }
-  var file = Array("RIFF".utf8) + le(UInt32(4 + 8 + fmt.count + 8 + 10 + 8 + samples.count)) + Array("WAVE".utf8)
-  file += Array("fmt ".utf8) + le(UInt32(fmt.count)) + fmt
-  file += Array("LIST".utf8) + le(UInt32(9)) + Array("INFOabcde".utf8) + [0]  // odd-sized chunk, padded
-  file += Array("data".utf8) + le(UInt32(samples.count)) + samples
+  var file: [UInt8] = Array("RIFF".utf8)
+  file += le(UInt32(4 + 8 + fmt.count + 8 + 10 + 8 + samples.count))
+  file += Array("WAVE".utf8)
+  file += Array("fmt ".utf8)
+  file += le(UInt32(fmt.count))
+  file += fmt
+  // An odd-sized chunk, padded to an even size.
+  file += Array("LIST".utf8)
+  file += le(UInt32(9))
+  file += Array("INFOabcde\0".utf8)
+  file += Array("data".utf8)
+  file += le(UInt32(samples.count))
+  file += samples
   let url = FileManager.default.temporaryDirectory.appendingPathComponent("wav_\(UUID().uuidString).wav")
   try Data(file).write(to: url)
   return url

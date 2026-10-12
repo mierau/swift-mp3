@@ -11,7 +11,7 @@ private func parseID3(_ data: Data) -> (frames: [(id: String, content: [UInt8])]
   var i = 10
   while i + 10 <= size, bytes[i] != 0 {
     let id = String(decoding: bytes[i..<i + 4], as: UTF8.self)
-    let length = Int(bytes[i + 4]) << 24 | Int(bytes[i + 5]) << 16 | Int(bytes[i + 6]) << 8 | Int(bytes[i + 7])
+    let length = bytes[i + 4..<i + 8].reduce(0) { $0 << 8 | Int($1) }
     frames.append((id, Array(bytes[i + 10..<i + 10 + length])))
     i += 10 + length
   }
@@ -46,7 +46,8 @@ private func userText(_ frames: [(id: String, content: [UInt8])], _ description:
   #expect(text(try #require(frames["TPOS"])) == "2/2")
   #expect(text(try #require(frames["TRCK"])) == "3/12")
   // USLT: encoding, language, empty description, then the lyrics.
-  #expect(try #require(frames["USLT"]) == [0] + Array("eng".utf8) + [0] + Array("La la la".utf8))
+  let expected: [UInt8] = [0, 0x65, 0x6E, 0x67, 0] + Array("La la la".utf8)
+  #expect(try #require(frames["USLT"]) == expected)
 }
 
 @Test func id3PaddingKeepsSizeAndRewritesInPlace() throws {
@@ -65,7 +66,10 @@ private func userText(_ frames: [(id: String, content: [UInt8])], _ description:
 @Test func sessionID3TagCarriesReplayGainAfterFlush() throws {
   let options = MP3EncoderOptions(sampleRate: 44_100, mode: .mono, id3Tag: ID3Tag(title: "Tone"))
   var session = try MP3Encoder(options: options).newSession()
-  let samples = (0..<44_100).map { Float(sin(2 * Double.pi * 1_000 * Double($0) / 44_100) * 0.5) }
+  let samples = (0..<44_100).map { i -> Float in
+    let phase: Double = 2 * Double.pi * 1_000 * Double(i) / 44_100
+    return Float(sin(phase) * 0.5)
+  }
   _ = session.encode(samples: samples)
   #expect(userText(try #require(parseID3(session.generateID3Tag())).frames, "REPLAYGAIN_TRACK_GAIN") == nil)
   _ = session.flush()
@@ -87,8 +91,9 @@ private func userText(_ frames: [(id: String, content: [UInt8])], _ description:
 
   let source = AsyncStream<[Float]> { continuation in
     for chunk in 0..<10 {
-      continuation.yield((0..<4_410).map { i in
-        Float(sin(2 * Double.pi * 440 * Double(chunk * 4_410 + i) / 44_100) * 0.25)
+      continuation.yield((0..<4_410).map { i -> Float in
+        let phase: Double = 2 * Double.pi * 440 * Double(chunk * 4_410 + i) / 44_100
+        return Float(sin(phase) * 0.25)
       })
     }
     continuation.finish()
