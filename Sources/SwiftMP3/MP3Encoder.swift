@@ -245,7 +245,11 @@ public struct MP3Encoder: Sendable {
   ) async throws {
     var state = EncoderSession(options: self.options)
 
-    let id3Data = state.generateID3Tag()
+    // Leave room in the ID3 tag for the ReplayGain frames, known only at the end.
+    let id3Data = options.id3Tag.map {
+      let size = max(ID3TagWriter.build(tag: $0).count, 10) + ID3TagWriter.replayGainFramesSize
+      return ID3TagWriter.build(tag: $0, minimumSize: size)
+    } ?? Data()
     let xingFrameSize = state.xingFrameSize
 
     // Create the file: [ID3 tag] + [Xing placeholder]
@@ -277,7 +281,11 @@ public struct MP3Encoder: Sendable {
         try handle.write(contentsOf: finalData)
       }
 
-      // Write the real Xing header after the ID3 tag
+      // Rewrite the ID3 tag with the ReplayGain, then the real Xing header after it.
+      if let tag = options.id3Tag {
+        try handle.seek(toOffset: 0)
+        try handle.write(contentsOf: ID3TagWriter.build(tag: tag, replayGain: state.id3ReplayGain, minimumSize: id3Data.count))
+      }
       let xingHeader = state.generateXingHeader()
       try handle.seek(toOffset: UInt64(id3Data.count))
       try handle.write(contentsOf: xingHeader)

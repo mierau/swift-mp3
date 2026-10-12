@@ -11,16 +11,26 @@ public struct ID3Tag: Sendable, Equatable {
   public var artist: String?
   /// The album name.
   public var album: String?
+  /// The album artist, when it differs from the track artist (TPE2).
+  public var albumArtist: String?
+  /// The composer (TCOM).
+  public var composer: String?
   /// The track number.
   public var track: UInt16?
   /// The total number of tracks.
   public var trackTotal: UInt16?
+  /// The disc number (TPOS).
+  public var disc: UInt16?
+  /// The total number of discs.
+  public var discTotal: UInt16?
   /// The release year.
   public var year: UInt16?
   /// The genre name.
   public var genre: String?
   /// A comment.
   public var comment: String?
+  /// Unsynchronized lyrics (USLT).
+  public var lyrics: String?
   /// Album artwork image data (JPEG or PNG).
   public var albumArt: Data?
   /// MIME type for the album artwork.
@@ -31,22 +41,32 @@ public struct ID3Tag: Sendable, Equatable {
     title: String? = nil,
     artist: String? = nil,
     album: String? = nil,
+    albumArtist: String? = nil,
+    composer: String? = nil,
     track: UInt16? = nil,
     trackTotal: UInt16? = nil,
+    disc: UInt16? = nil,
+    discTotal: UInt16? = nil,
     year: UInt16? = nil,
     genre: String? = nil,
     comment: String? = nil,
+    lyrics: String? = nil,
     albumArt: Data? = nil,
     albumArtMIMEType: String = "image/jpeg"
   ) {
     self.title = title
     self.artist = artist
     self.album = album
+    self.albumArtist = albumArtist
+    self.composer = composer
     self.track = track
     self.trackTotal = trackTotal
+    self.disc = disc
+    self.discTotal = discTotal
     self.year = year
     self.genre = genre
     self.comment = comment
+    self.lyrics = lyrics
     self.albumArt = albumArt
     self.albumArtMIMEType = albumArtMIMEType
   }
@@ -54,14 +74,24 @@ public struct ID3Tag: Sendable, Equatable {
 
 /// Assembles ID3v2.3 binary tag data from an ``ID3Tag``.
 enum ID3TagWriter {
-  /// Builds a complete ID3v2.3 tag from the given metadata.
-  /// Returns empty `Data` if no fields are set.
-  static func build(tag: ID3Tag) -> Data {
+  /// Track gain and peak written as `REPLAYGAIN_TRACK_*` TXXX frames.
+  struct ReplayGain: Equatable {
+    var gain: Double
+    var peak: Float
+  }
+
+  /// Builds a complete ID3v2.3 tag from the given metadata, with ReplayGain frames if
+  /// `replayGain` is set. The tag is padded to at least `minimumSize` bytes, so a tag
+  /// written before encoding can be rewritten in place once the gain is known.
+  /// Returns empty `Data` if no fields are set and no size is reserved.
+  static func build(tag: ID3Tag, replayGain: ReplayGain? = nil, minimumSize: Int = 0) -> Data {
     var frames = Data()
 
     if let title = tag.title { frames.append(textFrame(id: "TIT2", value: title)) }
     if let artist = tag.artist { frames.append(textFrame(id: "TPE1", value: artist)) }
     if let album = tag.album { frames.append(textFrame(id: "TALB", value: album)) }
+    if let albumArtist = tag.albumArtist { frames.append(textFrame(id: "TPE2", value: albumArtist)) }
+    if let composer = tag.composer { frames.append(textFrame(id: "TCOM", value: composer)) }
     if let genre = tag.genre { frames.append(textFrame(id: "TCON", value: genre)) }
 
     if let year = tag.year {
@@ -73,15 +103,34 @@ enum ID3TagWriter {
       frames.append(textFrame(id: "TRCK", value: value))
     }
 
+    if let disc = tag.disc {
+      let value = tag.discTotal.map { "\(disc)/\($0)" } ?? "\(disc)"
+      frames.append(textFrame(id: "TPOS", value: value))
+    }
+
     if let comment = tag.comment {
-      frames.append(commentFrame(comment: comment))
+      frames.append(languageTextFrame(id: "COMM", text: comment))
+    }
+
+    if let lyrics = tag.lyrics {
+      frames.append(languageTextFrame(id: "USLT", text: lyrics))
+    }
+
+    if let replayGain {
+      frames.append(userTextFrame(description: "REPLAYGAIN_TRACK_GAIN", value: replayGainValue(replayGain.gain)))
+      frames.append(userTextFrame(description: "REPLAYGAIN_TRACK_PEAK", value: replayPeakValue(replayGain.peak)))
     }
 
     if let art = tag.albumArt {
       frames.append(pictureFrame(art: art, mimeType: tag.albumArtMIMEType))
     }
 
-    if frames.isEmpty { return Data() }
+    if frames.isEmpty && minimumSize == 0 { return Data() }
+
+    // Padding: zero bytes after the last frame, counted in the tag size.
+    if frames.count + 10 < minimumSize {
+      frames.append(Data(count: minimumSize - 10 - frames.count))
+    }
 
     // ID3v2.3 header: "ID3" + version 2.3 + no flags + synchsafe size
     var header = Data()
@@ -91,6 +140,23 @@ enum ID3TagWriter {
     header.append(contentsOf: synchsafeSize(UInt32(frames.count)))
 
     return header + frames
+  }
+
+  /// Bytes the ReplayGain frames take at most, given the fixed-width values below.
+  static let replayGainFramesSize: Int = {
+    let widest = ReplayGain(gain: -99.99, peak: 99.999999)
+    return userTextFrame(description: "REPLAYGAIN_TRACK_GAIN", value: replayGainValue(widest.gain)).count
+      + userTextFrame(description: "REPLAYGAIN_TRACK_PEAK", value: replayPeakValue(widest.peak)).count
+  }()
+
+  /// Gain as foobar2000 and others write it, such as `-6.53 dB`.
+  private static func replayGainValue(_ gain: Double) -> String {
+    String(format: "%.2f dB", min(max(gain, -99.99), 99.99))
+  }
+
+  /// Peak as a linear amplitude, such as `0.988525`.
+  private static func replayPeakValue(_ peak: Float) -> String {
+    String(format: "%.6f", min(max(Double(peak), 0), 99.999999))
   }
 
   /// ID3v2.3 text encodings: ISO-8859-1 when possible, otherwise UTF-16 with a BOM.
@@ -123,7 +189,7 @@ enum ID3TagWriter {
     }
   }
 
-  /// Builds a text frame (TIT2, TPE1, TALB, TCON, TYER, TRCK).
+  /// Builds a text frame (TIT2, TPE1, TALB, TCON, TYER, TRCK, ...).
   private static func textFrame(id: String, value: String) -> Data {
     let encoding = TextEncoding(for: value)
     var content = Data([encoding.rawValue])
@@ -131,15 +197,25 @@ enum ID3TagWriter {
     return frameHeader(id: id, size: UInt32(content.count)) + content
   }
 
-  /// Builds a COMM (comment) frame.
-  private static func commentFrame(comment: String) -> Data {
-    let encoding = TextEncoding(for: comment)
+  /// Builds a COMM (comment) or USLT (lyrics) frame, which share a layout.
+  private static func languageTextFrame(id: String, text: String) -> Data {
+    let encoding = TextEncoding(for: text)
     var content = Data([encoding.rawValue])
     content.append(contentsOf: [0x65, 0x6E, 0x67])  // "eng"
     content.append(encoding.encode(""))  // Empty description
     content.append(encoding.terminator)
-    content.append(encoding.encode(comment))
-    return frameHeader(id: "COMM", size: UInt32(content.count)) + content
+    content.append(encoding.encode(text))
+    return frameHeader(id: id, size: UInt32(content.count)) + content
+  }
+
+  /// Builds a TXXX (user-defined text) frame.
+  private static func userTextFrame(description: String, value: String) -> Data {
+    let encoding = TextEncoding(for: description, value)
+    var content = Data([encoding.rawValue])
+    content.append(encoding.encode(description))
+    content.append(encoding.terminator)
+    content.append(encoding.encode(value))
+    return frameHeader(id: "TXXX", size: UInt32(content.count)) + content
   }
 
   /// Builds an APIC (attached picture) frame.

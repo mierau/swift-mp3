@@ -275,10 +275,19 @@ public struct EncoderSession {
 
   /// Generates the ID3v2.3 tag data for the configured metadata.
   ///
+  /// Called after ``flush()``, the tag also carries the track's ReplayGain as
+  /// `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` frames, for players that read
+  /// them from ID3 rather than the LAME tag.
+  ///
   /// Returns empty `Data` if no ID3 tag is configured or all fields are empty.
   public func generateID3Tag() -> Data {
     guard let tag = options.id3Tag else { return Data() }
-    return ID3TagWriter.build(tag: tag)
+    return ID3TagWriter.build(tag: tag, replayGain: finished ? id3ReplayGain : nil)
+  }
+
+  /// The ReplayGain to write to the ID3 tag, once there's enough audio to measure.
+  var id3ReplayGain: ID3TagWriter.ReplayGain? {
+    replayGain.map { ID3TagWriter.ReplayGain(gain: $0, peak: peakAmplitude) }
   }
 
   // MARK: - Analysis
