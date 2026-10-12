@@ -60,6 +60,20 @@ In Xcode, choose **File › Add Package Dependencies…** and enter the reposito
 
 ### Basic Encoding
 
+To encode a clip that's already in memory, call `encode(samples:)`. It returns a complete MP3 file, with the ID3 tag (if you set one) and the Info frame for seeking and gapless playback:
+
+```swift
+import SwiftMP3
+
+let encoder = try MP3Encoder(options: MP3EncoderOptions(sampleRate: 44_100, bitrateKbps: 128))
+let mp3 = encoder.encode(samples: pcmSamples)  // [Float] interleaved (L, R, L, R, ...)
+try mp3.write(to: outputURL)
+```
+
+It also takes `[Int16]` samples, `encode(planar:)` with one array per channel, and on Apple platforms `encode(buffer:)` with an `AVAudioPCMBuffer`.
+
+### Incremental Encoding
+
 Use `newSession()` to create a mutable encoding session for synchronous, incremental encoding:
 
 ```swift
@@ -87,7 +101,7 @@ file.append(xingHeader)
 file.append(mp3Data)
 ```
 
-`MP3Encoder(options:)` throws an `MP3EncoderError` if the sample rate, bitrate, or quality isn't supported.
+`MP3Encoder(options:)` throws an `MP3EncoderError` if the sample rate, bitrate, or quality isn't supported. To offer only valid choices, for example in a settings picker, use `MP3EncoderOptions.supportedOutputSampleRates` and `MP3EncoderOptions.supportedBitrates(outputSampleRate:)`. `MP3EncoderOptions` and `ID3Tag` are `Codable` and `Hashable`, so you can save them as presets.
 
 ### Other Input Formats
 
@@ -269,6 +283,8 @@ Configuration for the encoder.
 | `copyright` | `Bool` | `false` | Set the copyright bit in frame headers |
 | `id3Tag` | `ID3Tag?` | `nil` | ID3v2.3 metadata to embed at the start of the file |
 
+`MP3EncoderOptions.supportedOutputSampleRates` lists the MP3 sample rates and `supportedBitrates(outputSampleRate:)` the bitrates at each. Options and `ID3Tag` are `Codable` and `Hashable`, and `Mode` is `CaseIterable`.
+
 ### `MP3Encoder`
 
 Stateless, `Sendable` encoder that holds configuration. Safe to share across tasks.
@@ -276,6 +292,9 @@ Stateless, `Sendable` encoder that holds configuration. Safe to share across tas
 | Method | Description |
 |---|---|
 | `init(options:) throws` | Create an encoder; throws `MP3EncoderError` for unsupported options |
+| `encode(samples:) -> Data` | Encode `[Float]` or `[Int16]` samples in memory to a complete MP3 file (ID3 tag, Info frame, audio) |
+| `encode(planar:) -> Data` | Encode one array of samples per channel to a complete MP3 file |
+| `encode(buffer:) throws -> Data` | Encode an `AVAudioPCMBuffer` to a complete MP3 file (Apple platforms) |
 | `newSession() -> EncoderSession` | Create a mutable encoding session for synchronous use |
 | `encode(_:) -> AsyncThrowingStream<Data, Error>` | Stream MP3 frames from an `AsyncSequence` of `[Float]` or `[Int16]` |
 | `encode(_:to:) async throws` | Encode an `AsyncSequence` of `[Float]`, `[Int16]`, or `AVAudioPCMBuffer` to a file with Xing header (includes ID3 tag if set) |

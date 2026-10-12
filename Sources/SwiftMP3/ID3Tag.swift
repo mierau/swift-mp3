@@ -4,7 +4,7 @@
 import Foundation
 
 /// ID3v2.3 metadata for MP3 files.
-public struct ID3Tag: Sendable, Equatable {
+public struct ID3Tag: Sendable, Hashable, Codable {
   /// The track title.
   public var title: String?
   /// The artist name.

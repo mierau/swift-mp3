@@ -64,6 +64,15 @@ extension EncoderSession {
 }
 
 extension MP3Encoder {
+  /// Encodes an audio buffer in memory and returns a complete MP3 file, like
+  /// the float-sample `encode(samples:)`.
+  ///
+  /// - Throws: ``MP3EncoderError/unsupportedBufferFormat(_:)`` if the buffer doesn't suit
+  ///   ``EncoderSession/encode(buffer:)``.
+  public func encode(buffer: AVAudioPCMBuffer) throws -> Data {
+    try encodeFile { try $0.encode(buffer: buffer) }
+  }
+
   /// File encode of audio buffers: writes MP3 frames to disk with a Xing header, as the
   /// float-sample `encode(_:to:)` does. If encoding fails or is cancelled, the partly
   /// written file is removed.

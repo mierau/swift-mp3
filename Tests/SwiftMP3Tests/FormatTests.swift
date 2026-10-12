@@ -93,6 +93,32 @@ func picksOutputSampleRate(input: Int, output: Int) throws {
   #expect(error.description.contains("144"))
 }
 
+@Test func listsSupportedRatesAndBitrates() throws {
+  #expect(MP3EncoderOptions.supportedOutputSampleRates.first == 8_000)
+  #expect(MP3EncoderOptions.supportedOutputSampleRates.last == 48_000)
+  #expect(MP3EncoderOptions.supportedOutputSampleRates.count == 9)
+  #expect(MP3EncoderOptions.supportedBitrates(outputSampleRate: 44_100).last == 320)
+  #expect(MP3EncoderOptions.supportedBitrates(outputSampleRate: 22_050).last == 160)
+  #expect(MP3EncoderOptions.supportedBitrates(outputSampleRate: 96_000).isEmpty)
+  // Every listed combination is accepted.
+  for rate in MP3EncoderOptions.supportedOutputSampleRates {
+    for kbps in MP3EncoderOptions.supportedBitrates(outputSampleRate: rate) {
+      _ = try MP3Encoder(options: MP3EncoderOptions(sampleRate: rate, bitrateKbps: kbps))
+    }
+  }
+}
+
+@Test func optionsRoundTripThroughJSON() throws {
+  let options = MP3EncoderOptions(
+    sampleRate: 96_000, outputSampleRate: 48_000, bitrateKbps: 192, vbr: true, mode: .stereo, quality: 2,
+    id3Tag: ID3Tag(title: "Song", track: 3, albumArt: Data([1, 2, 3]), albumArtMIMEType: "image/png")
+  )
+  let decoded = try JSONDecoder().decode(MP3EncoderOptions.self, from: JSONEncoder().encode(options))
+  #expect(decoded == options)
+  #expect(Set([options, decoded]).count == 1)
+  #expect(MP3EncoderOptions.Mode.allCases == [.mono, .stereo, .jointStereo])
+}
+
 // MARK: - MPEG-2 and 2.5
 
 @Test(arguments: [
@@ -219,6 +245,44 @@ private func encodeAll(_ options: MP3EncoderOptions, _ body: (inout EncoderSessi
     return data
   }
   #expect(whole == chunked)
+}
+
+@Test func oddChunksMeasureTheSameLoudness() throws {
+  // The stereo loudness meter keeps its place when a chunk ends between left and right.
+  let input = musicLikeSignal(sampleRate: 44_100, channels: 2, seconds: 1)
+  let options = MP3EncoderOptions(mode: .stereo)
+  var whole = try MP3Encoder(options: options).newSession()
+  _ = whole.encode(samples: input)
+  _ = whole.flush()
+  var chunked = try MP3Encoder(options: options).newSession()
+  var start = 0
+  for size in [1, 333, 1_000, 2_001, 7] where start < input.count {
+    _ = chunked.encode(samples: Array(input[start..<min(start + size, input.count)]))
+    start += size
+  }
+  _ = chunked.encode(samples: Array(input[start...]))
+  _ = chunked.flush()
+  #expect(chunked.replayGain == whole.replayGain)
+  #expect(chunked.peakAmplitude == whole.peakAmplitude)
+  #expect(chunked.generateXingHeader() == whole.generateXingHeader())
+}
+
+@Test func oneShotEncodeAssemblesTheFile() throws {
+  let input = musicLikeSignal(sampleRate: 44_100, channels: 2, seconds: 1)
+  let options = MP3EncoderOptions(id3Tag: ID3Tag(title: "Clip"))
+  let encoder = try MP3Encoder(options: options)
+  var session = encoder.newSession()
+  var audio = session.encode(samples: input)
+  audio.append(session.flush())
+  let file = encoder.encode(samples: input)
+  #expect(file == session.generateID3Tag() + session.generateXingHeader() + audio)
+
+  let left = stride(from: 0, to: input.count, by: 2).map { input[$0] }
+  let right = stride(from: 1, to: input.count, by: 2).map { input[$0] }
+  #expect(encoder.encode(planar: [left, right]) == file)
+  let ints = input.map { Int16(($0 * 32_767).rounded()) }
+  let floats = ints.map { Float($0) / 32_768 }
+  #expect(encoder.encode(samples: ints) == encoder.encode(samples: floats))
 }
 
 @Test func monoEncoderAveragesPlanarChannels() throws {

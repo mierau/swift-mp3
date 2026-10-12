@@ -4,9 +4,9 @@
 import Foundation
 
 /// Configuration options for the MP3 encoder.
-public struct MP3EncoderOptions: Sendable, Equatable {
+public struct MP3EncoderOptions: Sendable, Hashable, Codable {
   /// The channel mode for the encoded audio.
-  public enum Mode: String, Sendable, Equatable {
+  public enum Mode: String, Sendable, Hashable, Codable, CaseIterable {
     /// A single audio channel.
     case mono
     /// Two independently encoded channels.
@@ -82,6 +82,15 @@ public struct MP3EncoderOptions: Sendable, Equatable {
     self.id3Tag = id3Tag
   }
 
+  /// The sample rates an MP3 can store, in Hz, from lowest to highest.
+  public static let supportedOutputSampleRates: [Int] = MPEGVersion.allSampleRates.sorted()
+
+  /// The bitrates allowed at an MP3 sample rate, in kbps, from lowest to highest, or an
+  /// empty array if MP3 can't store `outputSampleRate`.
+  public static func supportedBitrates(outputSampleRate: Int) -> [Int] {
+    MPEGVersion(sampleRate: outputSampleRate).map { Array($0.bitrates.dropFirst()) } ?? []
+  }
+
   /// Number of interleaved channels expected in the input.
   var channelCount: Int { mode == .mono ? 1 : 2 }
 
@@ -111,9 +120,9 @@ public enum MP3EncoderError: Error, Equatable, Sendable, CustomStringConvertible
   public var description: String {
     switch self {
     case .unsupportedSampleRate(let rate):
-      return "Unsupported sample rate \(rate) Hz; expected one of \(MPEGVersion.allSampleRates.sorted())"
+      return "Unsupported sample rate \(rate) Hz; expected one of \(MP3EncoderOptions.supportedOutputSampleRates)"
     case .unsupportedBitrate(let kbps, let rate):
-      let allowed = MPEGVersion(sampleRate: rate).map { Array($0.bitrates.dropFirst()) } ?? []
+      let allowed = MP3EncoderOptions.supportedBitrates(outputSampleRate: rate)
       return "Unsupported bitrate \(kbps) kbps at \(rate) Hz; expected one of \(allowed)"
     case .invalidQuality(let quality):
       return "Invalid quality \(quality); expected 0 through 9"
@@ -167,6 +176,38 @@ public struct MP3Encoder: Sendable {
   /// Creates a mutable encoding session for synchronous use.
   public func newSession() -> EncoderSession {
     EncoderSession(options: self.options)
+  }
+
+  /// Encodes a whole clip in memory and returns a complete MP3 file: the ID3 tag (if
+  /// ``MP3EncoderOptions/id3Tag`` is set, with ReplayGain), the Info frame for seeking
+  /// and gapless playback, and the audio.
+  ///
+  /// - Parameter samples: Interleaved PCM float samples (L, R, L, R, ... for stereo),
+  ///   normalized to [-1.0, 1.0].
+  public func encode(samples: [Float]) -> Data {
+    encodeFile { $0.encode(samples: samples) }
+  }
+
+  /// Encodes interleaved 16-bit samples in memory, like the float-sample `encode(samples:)`.
+  public func encode(samples: [Int16]) -> Data {
+    encodeFile { $0.encode(samples: samples) }
+  }
+
+  /// Encodes one array of samples per channel in memory, like the float-sample `encode(samples:)`.
+  /// See ``EncoderSession/encode(planar:)`` for how channel counts are matched.
+  public func encode(planar channels: [[Float]]) -> Data {
+    encodeFile { $0.encode(planar: channels) }
+  }
+
+  /// Runs a session over `feed` and assembles the file: ID3 tag, Info frame, then audio.
+  func encodeFile(_ feed: (inout EncoderSession) throws -> Data) rethrows -> Data {
+    var session = newSession()
+    var audio = try feed(&session)
+    audio.append(session.flush())
+    var file = session.generateID3Tag()
+    file.append(session.generateXingHeader())
+    file.append(audio)
+    return file
   }
 
   /// Streaming encode: yields MP3 frames as `Data` chunks. No Xing header is included.
