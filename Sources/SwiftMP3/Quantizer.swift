@@ -673,9 +673,14 @@ private struct GranuleQuantization {
     for band in 0..<layout.count {
       let start = layout.start[band]
       guard start < lastLine else { break }
-      let step = tables.inverseStep(stepExponent(info, band: band))
+      let step = SIMD8<Float>(repeating: tables.inverseStep(stepExponent(info, band: band)))
       n = layout.end[band]
-      (steps + start).update(repeating: step, count: n - start)
+      // Fill eight at a time; a store that runs past the band is overwritten by the next.
+      var i = start
+      while i < n {
+        UnsafeMutableRawPointer(steps + i).storeBytes(of: step, as: SIMD8<Float>.self)
+        i += 8
+      }
     }
     let vectorEnd = (n + 7) & ~7
     (steps + n).update(repeating: 0, count: vectorEnd - n)

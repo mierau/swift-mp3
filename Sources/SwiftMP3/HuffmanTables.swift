@@ -317,7 +317,16 @@ enum HuffmanTables {
     }
     let linbits = UnsafeMutablePointer<Int>.allocate(capacity: 32)
     for t in 0..<32 { linbits[t] = tables[t].linbits }
-    return FlatHuffmanTables(lengths: lengths, codes: codes, linbits: linbits)
+    let pairCosts = UnsafeMutablePointer<SIMD16<UInt16>>.allocate(capacity: 256)
+    for index in 0..<256 {
+      var costs = SIMD16<UInt16>()
+      for (lane, table) in FlatHuffmanTables.pairCostTables.enumerated() {
+        costs[lane] = UInt16(lengths[table * 256 + index])
+      }
+      costs[FlatHuffmanTables.signLane] = (index >> 4 != 0 ? 1 : 0) + (index & 15 != 0 ? 1 : 0)
+      pairCosts[index] = costs
+    }
+    return FlatHuffmanTables(lengths: lengths, codes: codes, linbits: linbits, pairCosts: pairCosts)
   }()
 }
 
@@ -326,10 +335,38 @@ struct FlatHuffmanTables: @unchecked Sendable {
   let lengths: UnsafePointer<UInt8>
   let codes: UnsafePointer<UInt32>
   let linbits: UnsafePointer<Int>
+  /// For each pair index `min(x, 15) * 16 + min(y, 15)`, its code length in every table
+  /// of ``pairCostTables`` and, in ``signLane``, its sign bits, so that one vector add
+  /// counts a pair in all tables at once.
+  let pairCosts: UnsafePointer<SIMD16<UInt16>>
 
-  init(lengths: UnsafeMutablePointer<UInt8>, codes: UnsafeMutablePointer<UInt32>, linbits: UnsafeMutablePointer<Int>) {
+  /// The tables with a lane in ``pairCosts``: every table that codes pairs without
+  /// escapes, then 16 and 24, whose codes the other escape tables share.
+  static let pairCostTables = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 24]
+  static let signLane = 15
+
+  /// The lane of ``pairCosts`` holding `table`'s code lengths (tables 16-23 share 16's,
+  /// and 24-31 share 24's).
+  @inline(__always)
+  static func lane(of table: Int) -> Int {
+    switch table {
+    case 1...3: return table - 1
+    case 5...13: return table - 2
+    case 15: return 12
+    case 16...23: return 13
+    default: return 14
+    }
+  }
+
+  init(
+    lengths: UnsafeMutablePointer<UInt8>,
+    codes: UnsafeMutablePointer<UInt32>,
+    linbits: UnsafeMutablePointer<Int>,
+    pairCosts: UnsafeMutablePointer<SIMD16<UInt16>>
+  ) {
     self.lengths = UnsafePointer(lengths)
     self.codes = UnsafePointer(codes)
     self.linbits = UnsafePointer(linbits)
+    self.pairCosts = UnsafePointer(pairCosts)
   }
 }
